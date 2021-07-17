@@ -11,6 +11,8 @@ var big3: JsBigInt = big"2"
 
 doAssert big3 == big"2"
 doAssert (big3 xor big2) == big"664"
+doAssert (big"555" and big"2") == big"2"
+doAssert (big"555" or big"2") == big"555"
 doAssert (big1 mod big2) == big"613"
 doAssert -big1 == big"-2147483647"
 doAssert big1 div big2 == big"3224449"
@@ -24,7 +26,7 @@ doAssert big1.toCstring(10) == "2147483647".cstring
 doAssert big2 ** big3 == big(443556)
 var huge = big"999999999999999999999999999999999999999999999999999999999999999999999999999999999999999"
 huge.inc
-huge = huge + big"-999999999999999999999999999999999999999999999999999999999999999999999999999999999999999"
+huge = huge + -999999999999999999999999999999999999999999999999999999999999999999999999999999999999999'big
 doAssert huge == big"1"
 var list: seq[JsBigInt]
 for i in big"0" .. big"5":
@@ -38,7 +40,7 @@ for i in big"0" ..< big"5":
 doAssert list == @[big"0", big"1", big"2", big"3", big"4"]
 
 block:
-  let b = big"2"
-  doAssert -b ** big"3" == big"-8"
+  let b = 2'big
+  doAssert -b ** 3'big == -8'big
   doAssert -b ** big"2" == big"4" # not -4 because of precedence
   doAssert -big"3" == big"-3"

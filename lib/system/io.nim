@@ -7,7 +7,7 @@
 #    distribution, for details about the copyright.
 #
 
-## This is a part of ``system.nim``, you should not manually import it.
+## This is a part of `system.nim`, you should not manually import it.
 
 
 include inclrtl
@@ -143,13 +143,13 @@ proc raiseEOF() {.noinline, noreturn.} =
 
 proc strerror(errnum: cint): cstring {.importc, header: "<string.h>".}
 
-when not defined(NimScript):
+when not defined(nimscript):
   var
     errno {.importc, header: "<errno.h>".}: cint ## error variable
     EINTR {.importc: "EINTR", header: "<errno.h>".}: cint
 
 proc checkErr(f: File) =
-  when not defined(NimScript):
+  when not defined(nimscript):
     if c_ferror(f) != 0:
       let msg = "errno: " & $errno & " `" & $strerror(errno) & "`"
       c_clearerr(f)
@@ -169,19 +169,23 @@ proc readBuffer*(f: File, buffer: pointer, len: Natural): int {.
 
 proc readBytes*(f: File, a: var openArray[int8|uint8], start, len: Natural): int {.
   tags: [ReadIOEffect], benign.} =
-  ## reads `len` bytes into the buffer `a` starting at ``a[start]``. Returns
+  ## reads `len` bytes into the buffer `a` starting at `a[start]`. Returns
   ## the actual number of bytes that have been read which may be less than
   ## `len` (if not as many bytes are remaining), but not greater.
   result = readBuffer(f, addr(a[start]), len)
 
+proc readChars*(f: File, a: var openArray[char]): int {.tags: [ReadIOEffect], benign.} =
+  ## reads up to `a.len` bytes into the buffer `a`. Returns
+  ## the actual number of bytes that have been read which may be less than
+  ## `a.len` (if not as many bytes are remaining), but not greater.
+  result = readBuffer(f, addr(a[0]), a.len)
+
 proc readChars*(f: File, a: var openArray[char], start, len: Natural): int {.
-  tags: [ReadIOEffect], benign.} =
-  ## reads `len` bytes into the buffer `a` starting at ``a[start]``. Returns
+  tags: [ReadIOEffect], benign, deprecated:
+    "use other `readChars` overload, possibly via: readChars(toOpenArray(buf, start, len-1))".} =
+  ## reads `len` bytes into the buffer `a` starting at `a[start]`. Returns
   ## the actual number of bytes that have been read which may be less than
   ## `len` (if not as many bytes are remaining), but not greater.
-  ##
-  ## **Warning:** The buffer `a` must be pre-allocated. This can be done
-  ## using, for example, ``newString``.
   if (start + len) > len(a):
     raiseEIO("buffer overflow: (start+len) > length of openarray buffer")
   result = readBuffer(f, addr(a[start]), len)
@@ -201,7 +205,7 @@ proc writeBuffer*(f: File, buffer: pointer, len: Natural): int {.
 
 proc writeBytes*(f: File, a: openArray[int8|uint8], start, len: Natural): int {.
   tags: [WriteIOEffect], benign.} =
-  ## writes the bytes of ``a[start..start+len-1]`` to the file `f`. Returns
+  ## writes the bytes of `a[start..start+len-1]` to the file `f`. Returns
   ## the number of actual written bytes, which may be less than `len` in case
   ## of an error.
   var x = cast[ptr UncheckedArray[int8]](a)
@@ -209,7 +213,7 @@ proc writeBytes*(f: File, a: openArray[int8|uint8], start, len: Natural): int {.
 
 proc writeChars*(f: File, a: openArray[char], start, len: Natural): int {.
   tags: [WriteIOEffect], benign.} =
-  ## writes the bytes of ``a[start..start+len-1]`` to the file `f`. Returns
+  ## writes the bytes of `a[start..start+len-1]` to the file `f`. Returns
   ## the number of actual written bytes, which may be less than `len` in case
   ## of an error.
   var x = cast[ptr UncheckedArray[int8]](a)
@@ -223,9 +227,6 @@ when defined(windows):
     # But we cannot call printf directly as the string might contain \0.
     # So we have to loop over all the sections separated by potential \0s.
     var i = c_fprintf(f, "%s", s)
-    if i < 0:
-      if doRaise: raiseEIO("cannot write string to file")
-      return
     while i < s.len:
       if s[i] == '\0':
         let w = c_fputc('\0', f)
@@ -248,7 +249,7 @@ proc write*(f: File, s: string) {.tags: [WriteIOEffect], benign.} =
       raiseEIO("cannot write string to file")
 {.pop.}
 
-when NoFakeVars:
+when defined(nimscript):
   when defined(windows):
     const
       IOFBF = cint(0)
@@ -321,7 +322,7 @@ proc flushFile*(f: File) {.tags: [WriteIOEffect].} =
   discard c_fflush(f)
 
 proc getFileHandle*(f: File): FileHandle =
-  ## returns the file handle of the file ``f``. This is only useful for
+  ## returns the file handle of the file `f`. This is only useful for
   ## platform specific programming.
   ## Note that on Windows this doesn't return the Windows-specific handle,
   ## but the C library's notion of a handle, whatever that means.
@@ -329,7 +330,7 @@ proc getFileHandle*(f: File): FileHandle =
   c_fileno(f)
 
 proc getOsFileHandle*(f: File): FileHandle =
-  ## returns the OS file handle of the file ``f``. This is only useful for
+  ## returns the OS file handle of the file `f`. This is only useful for
   ## platform specific programming.
   when defined(windows):
     result = FileHandle getOsfhandle(cint getFileHandle(f))
@@ -339,7 +340,7 @@ proc getOsFileHandle*(f: File): FileHandle =
 when defined(nimdoc) or (defined(posix) and not defined(nimscript)) or defined(windows):
   proc setInheritable*(f: FileHandle, inheritable: bool): bool =
     ## control whether a file handle can be inherited by child processes. Returns
-    ## ``true`` on success. This requires the OS file handle, which can be
+    ## `true` on success. This requires the OS file handle, which can be
     ## retrieved via `getOsFileHandle <#getOsFileHandle,File>`_.
     ##
     ## This procedure is not guaranteed to be available for all platforms. Test for
@@ -362,10 +363,10 @@ proc readLine*(f: File, line: var string): bool {.tags: [ReadIOEffect],
               benign.} =
   ## reads a line of text from the file `f` into `line`. May throw an IO
   ## exception.
-  ## A line of text may be delimited by ``LF`` or ``CRLF``. The newline
-  ## character(s) are not part of the returned string. Returns ``false``
-  ## if the end of the file has been reached, ``true`` otherwise. If
-  ## ``false`` is returned `line` contains no new data.
+  ## A line of text may be delimited by `LF` or `CRLF`. The newline
+  ## character(s) are not part of the returned string. Returns `false`
+  ## if the end of the file has been reached, `true` otherwise. If
+  ## `false` is returned `line` contains no new data.
   proc c_memchr(s: pointer, c: cint, n: csize_t): pointer {.
     importc: "memchr", header: "<string.h>".}
 
@@ -434,21 +435,21 @@ proc readLine*(f: File, line: var string): bool {.tags: [ReadIOEffect],
   var pos = 0
 
   # Use the currently reserved space for a first try
-  var sp = max(line.string.len, 80)
-  line.string.setLen(sp)
+  var sp = max(line.len, 80)
+  line.setLen(sp)
 
   while true:
     # memset to \L so that we can tell how far fgets wrote, even on EOF, where
     # fgets doesn't append an \L
-    for i in 0..<sp: line.string[pos+i] = '\L'
+    for i in 0..<sp: line[pos+i] = '\L'
 
     var fgetsSuccess: bool
     while true:
       # fixes #9634; this pattern may need to be abstracted as a template if reused;
       # likely other io procs need this for correctness.
-      fgetsSuccess = c_fgets(addr line.string[pos], sp.cint, f) != nil
+      fgetsSuccess = c_fgets(addr line[pos], sp.cint, f) != nil
       if fgetsSuccess: break
-      when not defined(NimScript):
+      when not defined(nimscript):
         if errno == EINTR:
           errno = 0
           c_clearerr(f)
@@ -456,20 +457,20 @@ proc readLine*(f: File, line: var string): bool {.tags: [ReadIOEffect],
       checkErr(f)
       break
 
-    let m = c_memchr(addr line.string[pos], '\L'.ord, cast[csize_t](sp))
+    let m = c_memchr(addr line[pos], '\L'.ord, cast[csize_t](sp))
     if m != nil:
       # \l found: Could be our own or the one by fgets, in any case, we're done
-      var last = cast[ByteAddress](m) - cast[ByteAddress](addr line.string[0])
-      if last > 0 and line.string[last-1] == '\c':
-        line.string.setLen(last-1)
+      var last = cast[ByteAddress](m) - cast[ByteAddress](addr line[0])
+      if last > 0 and line[last-1] == '\c':
+        line.setLen(last-1)
         return last > 1 or fgetsSuccess
         # We have to distinguish between two possible cases:
         # \0\l\0 => line ending in a null character.
         # \0\l\l => last line without newline, null was put there by fgets.
-      elif last > 0 and line.string[last-1] == '\0':
-        if last < pos + sp - 1 and line.string[last+1] != '\0':
+      elif last > 0 and line[last-1] == '\0':
+        if last < pos + sp - 1 and line[last+1] != '\0':
           dec last
-      line.string.setLen(last)
+      line.setLen(last)
       return last > 0 or fgetsSuccess
     else:
       # fgets will have inserted a null byte at the end of the string.
@@ -477,11 +478,11 @@ proc readLine*(f: File, line: var string): bool {.tags: [ReadIOEffect],
     # No \l found: Increase buffer and read more
     inc pos, sp
     sp = 128 # read in 128 bytes at a time
-    line.string.setLen(pos+sp)
+    line.setLen(pos+sp)
 
 proc readLine*(f: File): string  {.tags: [ReadIOEffect], benign.} =
   ## reads a line of text from the file `f`. May throw an IO exception.
-  ## A line of text may be delimited by ``LF`` or ``CRLF``. The newline
+  ## A line of text may be delimited by `LF` or `CRLF`. The newline
   ## character(s) are not part of the returned string.
   result = newStringOfCap(80)
   if not readLine(f, result): raiseEOF()
@@ -676,7 +677,7 @@ proc open*(f: var File, filename: string,
   ## Default mode is readonly. Returns true if the file could be opened.
   ## This throws no exception if the file could not be opened.
   ##
-  ## The file handle associated with the resulting ``File`` is not inheritable.
+  ## The file handle associated with the resulting `File` is not inheritable.
   var p = fopen(filename, FormatOpen[mode])
   if p != nil:
     var f2 = cast[File](p)
@@ -720,7 +721,7 @@ proc reopen*(f: File, filename: string, mode: FileMode = fmRead): bool {.
 
 proc open*(f: var File, filehandle: FileHandle,
            mode: FileMode = fmRead): bool {.tags: [], raises: [], benign.} =
-  ## Creates a ``File`` from a `filehandle` with given `mode`.
+  ## Creates a `File` from a `filehandle` with given `mode`.
   ##
   ## Default mode is readonly. Returns true if the file could be opened.
   ##
@@ -736,10 +737,10 @@ proc open*(filename: string,
             mode: FileMode = fmRead, bufSize: int = -1): File =
   ## Opens a file named `filename` with given `mode`.
   ##
-  ## Default mode is readonly. Raises an ``IOError`` if the file
+  ## Default mode is readonly. Raises an `IOError` if the file
   ## could not be opened.
   ##
-  ## The file handle associated with the resulting ``File`` is not inheritable.
+  ## The file handle associated with the resulting `File` is not inheritable.
   if not open(result, filename, mode, bufSize):
     sysFatal(IOError, "cannot open: " & filename)
 
@@ -783,13 +784,6 @@ when declared(stdout):
                      not defined(nintendoswitch) and not defined(freertos) and
                      hostOS != "any"
 
-  const echoDoRaise = not defined(nimLegacyEchoNoRaise) and not defined(guiapp) # see PR #16366
-
-  template checkErrMaybe(succeeded: bool): untyped =
-    if not succeeded:
-      when echoDoRaise:
-        checkErr(stdout)
-
   proc echoBinSafe(args: openArray[string]) {.compilerproc.} =
     when defined(androidNDK):
       var s = ""
@@ -802,18 +796,20 @@ when declared(stdout):
         proc flockfile(f: File) {.importc, nodecl.}
         proc funlockfile(f: File) {.importc, nodecl.}
         flockfile(stdout)
-        defer: funlockfile(stdout)
       when defined(windows) and compileOption("threads"):
         acquireSys echoLock
-        defer: releaseSys echoLock
       for s in args:
         when defined(windows):
-          writeWindows(stdout, s, doRaise = echoDoRaise)
+          writeWindows(stdout, s)
         else:
-          checkErrMaybe(c_fwrite(s.cstring, cast[csize_t](s.len), 1, stdout) == s.len)
+          discard c_fwrite(s.cstring, cast[csize_t](s.len), 1, stdout)
       const linefeed = "\n"
-      checkErrMaybe(c_fwrite(linefeed.cstring, linefeed.len, 1, stdout) == linefeed.len)
-      checkErrMaybe(c_fflush(stdout) == 0)
+      discard c_fwrite(linefeed.cstring, linefeed.len, 1, stdout)
+      discard c_fflush(stdout)
+      when stdOutLock:
+        funlockfile(stdout)
+      when defined(windows) and compileOption("threads"):
+        releaseSys echoLock
 
 
 when defined(windows) and not defined(nimscript) and not defined(js):
@@ -885,7 +881,7 @@ proc writeFile*(filename: string, content: openArray[byte]) {.since: (1, 1).} =
 proc readLines*(filename: string, n: Natural): seq[string] =
   ## read `n` lines from the file named `filename`. Raises an IO exception
   ## in case of an error. Raises EOF if file does not contain at least `n` lines.
-  ## Available at compile time. A line of text may be delimited by ``LF`` or ``CRLF``.
+  ## Available at compile time. A line of text may be delimited by `LF` or `CRLF`.
   ## The newline character(s) are not part of the returned strings.
   var f: File = nil
   if open(f, filename):
@@ -908,14 +904,14 @@ iterator lines*(filename: string): string {.tags: [ReadIOEffect].} =
   ## If the file does not exist `IOError` is raised. The trailing newline
   ## character(s) are removed from the iterated lines. Example:
   ##
-  ## .. code-block:: nim
-  ##   import strutils
-  ##
-  ##   proc transformLetters(filename: string) =
-  ##     var buffer = ""
-  ##     for line in filename.lines:
-  ##       buffer.add(line.replace("a", "0") & '\x0A')
-  ##     writeFile(filename, buffer)
+  runnableExamples:
+    import std/strutils
+
+    proc transformLetters(filename: string) =
+      var buffer = ""
+      for line in filename.lines:
+        buffer.add(line.replace("a", "0") & '\n')
+      writeFile(filename, buffer)
   var f = open(filename, bufSize=8000)
   try:
     var res = newStringOfCap(80)
@@ -927,14 +923,13 @@ iterator lines*(f: File): string {.tags: [ReadIOEffect].} =
   ## Iterate over any line in the file `f`.
   ##
   ## The trailing newline character(s) are removed from the iterated lines.
-  ## Example:
   ##
-  ## .. code-block:: nim
-  ##   proc countZeros(filename: File): tuple[lines, zeros: int] =
-  ##     for line in filename.lines:
-  ##       for letter in line:
-  ##         if letter == '0':
-  ##           result.zeros += 1
-  ##       result.lines += 1
+  runnableExamples:
+    proc countZeros(filename: File): tuple[lines, zeros: int] =
+      for line in filename.lines:
+        for letter in line:
+          if letter == '0':
+            result.zeros += 1
+        result.lines += 1
   var res = newStringOfCap(80)
   while f.readLine(res): yield res

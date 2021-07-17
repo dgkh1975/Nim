@@ -32,7 +32,7 @@
 
 # included from sigmatch.nim
 
-import algorithm, sets, prefixmatches, lineinfos, parseutils, linter
+import algorithm, sets, prefixmatches, lineinfos, parseutils, linter, tables
 from wordrecg import wDeprecated, wError, wAddr, wYield
 
 when defined(nimsuggest):
@@ -112,7 +112,7 @@ proc getTokenLenFromSource(conf: ConfigRef; ident: string; info: TLineInfo): int
     if ident[^1] == '=' and ident[0] in linter.Letters:
       if sourceIdent != "=":
         result = 0
-    elif sourceIdent.len > ident.len and sourceIdent[..ident.high] == ident:
+    elif sourceIdent.len > ident.len and sourceIdent[0..ident.high] == ident:
       result = ident.len
     elif sourceIdent != ident:
       result = 0
@@ -253,22 +253,34 @@ proc filterSymNoOpr(s: PSym; prefix: PNode; res: var PrefixMatch): bool {.inline
 proc fieldVisible*(c: PContext, f: PSym): bool {.inline.} =
   let fmoduleId = getModule(f).id
   result = sfExported in f.flags or fmoduleId == c.module.id
-  for module in c.friendModules:
-    if fmoduleId == module.id:
-      result = true
-      break
+
+  if not result:
+    for module in c.friendModules:
+      if fmoduleId == module.id: return true
+    if f.kind == skField:
+      var symObj = f.owner
+      if symObj.typ.kind in {tyRef, tyPtr}:
+        symObj = symObj.typ[0].sym
+      for scope in allScopes(c.currentScope):
+        for sym in scope.allowPrivateAccess:
+          if symObj.id == sym.id: return true
+
+proc getQuality(s: PSym): range[0..100] =
+  result = 100
+  if s.typ != nil and s.typ.len > 1:
+    var exp = s.typ[1].skipTypes({tyGenericInst, tyVar, tyLent, tyAlias, tySink})
+    if exp.kind == tyVarargs: exp = elemType(exp)
+    if exp.kind in {tyUntyped, tyTyped, tyGenericParam, tyAnything}: result = 50
+
+  # penalize deprecated symbols
+  if sfDeprecated in s.flags:
+    result = result - 5
 
 proc suggestField(c: PContext, s: PSym; f: PNode; info: TLineInfo; outputs: var Suggestions) =
   var pm: PrefixMatch
   if filterSym(s, f, pm) and fieldVisible(c, s):
-    outputs.add(symToSuggest(c.graph, s, isLocal=true, ideSug, info, 100, pm, c.inTypeContext > 0, 0))
-
-proc getQuality(s: PSym): range[0..100] =
-  if s.typ != nil and s.typ.len > 1:
-    var exp = s.typ[1].skipTypes({tyGenericInst, tyVar, tyLent, tyAlias, tySink})
-    if exp.kind == tyVarargs: exp = elemType(exp)
-    if exp.kind in {tyUntyped, tyTyped, tyGenericParam, tyAnything}: return 50
-  return 100
+    outputs.add(symToSuggest(c.graph, s, isLocal=true, ideSug, info,
+                              s.getQuality, pm, c.inTypeContext > 0, 0))
 
 template wholeSymTab(cond, section: untyped) {.dirty.} =
   for (item, scopeN, isLocal) in allSyms(c):
@@ -347,8 +359,8 @@ proc suggestEverything(c: PContext, n, f: PNode, outputs: var Suggestions) =
   for (it, scopeN, isLocal) in allSyms(c):
     var pm: PrefixMatch
     if filterSym(it, f, pm):
-      outputs.add(symToSuggest(c.graph, it, isLocal = isLocal, ideSug, n.info, 0, pm,
-                                c.inTypeContext > 0, scopeN))
+      outputs.add(symToSuggest(c.graph, it, isLocal = isLocal, ideSug, n.info,
+                               it.getQuality, pm, c.inTypeContext > 0, scopeN))
 
 proc suggestFieldAccess(c: PContext, n, field: PNode, outputs: var Suggestions) =
   # special code that deals with ``myObj.``. `n` is NOT the nkDotExpr-node, but
@@ -368,9 +380,12 @@ proc suggestFieldAccess(c: PContext, n, field: PNode, outputs: var Suggestions) 
         else:
           for it in allSyms(c.graph, n.sym):
             if filterSym(it, field, pm):
-              outputs.add(symToSuggest(c.graph, it, isLocal=false, ideSug, n.info, 100, pm, c.inTypeContext > 0, -100))
-          outputs.add(symToSuggest(c.graph, m, isLocal=false, ideMod, n.info, 100, PrefixMatch.None,
-            c.inTypeContext > 0, -99))
+              outputs.add(symToSuggest(c.graph, it, isLocal=false, ideSug,
+                                        n.info, it.getQuality, pm,
+                                        c.inTypeContext > 0, -100))
+          outputs.add(symToSuggest(c.graph, m, isLocal=false, ideMod, n.info,
+                                    100, PrefixMatch.None, c.inTypeContext > 0,
+                                    -99))
 
   if typ == nil:
     # a module symbol has no type for example:
@@ -379,11 +394,15 @@ proc suggestFieldAccess(c: PContext, n, field: PNode, outputs: var Suggestions) 
         # all symbols accessible, because we are in the current module:
         for it in items(c.topLevelScope.symbols):
           if filterSym(it, field, pm):
-            outputs.add(symToSuggest(c.graph, it, isLocal=false, ideSug, n.info, 100, pm, c.inTypeContext > 0, -99))
+            outputs.add(symToSuggest(c.graph, it, isLocal=false, ideSug,
+                                      n.info, it.getQuality, pm,
+                                      c.inTypeContext > 0, -99))
       else:
         for it in allSyms(c.graph, n.sym):
           if filterSym(it, field, pm):
-            outputs.add(symToSuggest(c.graph, it, isLocal=false, ideSug, n.info, 100, pm, c.inTypeContext > 0, -99))
+            outputs.add(symToSuggest(c.graph, it, isLocal=false, ideSug,
+                                      n.info, it.getQuality, pm,
+                                      c.inTypeContext > 0, -99))
     else:
       # fallback:
       suggestEverything(c, n, field, outputs)
@@ -553,7 +572,8 @@ proc markOwnerModuleAsUsed(c: PContext; s: PSym) =
     var i = 0
     while i <= high(c.unusedImports):
       let candidate = c.unusedImports[i][0]
-      if candidate == module or c.exportIndirections.contains((candidate.id, s.id)):
+      if candidate == module or c.importModuleMap.getOrDefault(candidate.id, int.low) == module.id or
+        c.exportIndirections.contains((candidate.id, s.id)):
         # mark it as used:
         c.unusedImports.del(i)
       else:
@@ -667,7 +687,7 @@ proc suggestSentinel*(c: PContext) =
     var pm: PrefixMatch
     if filterSymNoOpr(it, nil, pm):
       outputs.add(symToSuggest(c.graph, it, isLocal = isLocal, ideSug,
-          newLineInfo(c.config.m.trackPos.fileIndex, 0, -1), 0,
+          newLineInfo(c.config.m.trackPos.fileIndex, 0, -1), it.getQuality,
           PrefixMatch.None, false, scopeN))
 
   dec(c.compilesContextId)

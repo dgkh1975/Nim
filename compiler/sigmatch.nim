@@ -13,7 +13,7 @@
 import
   intsets, ast, astalgo, semdata, types, msgs, renderer, lookups, semtypinst,
   magicsys, idents, lexer, options, parampatterns, strutils, trees,
-  linter, lineinfos, lowerings, modulegraphs
+  linter, lineinfos, lowerings, modulegraphs, concepts
 
 type
   MismatchKind* = enum
@@ -86,21 +86,6 @@ type
 
   TTypeRelFlags* = set[TTypeRelFlag]
 
-  TTypeRelation* = enum      # order is important!
-    isNone, isConvertible,
-    isIntConv,
-    isSubtype,
-    isSubrange,              # subrange of the wanted type; no type conversion
-                             # but apart from that counts as ``isSubtype``
-    isBothMetaConvertible    # generic proc parameter was matched against
-                             # generic type, e.g., map(mySeq, x=>x+1),
-                             # maybe recoverable by rerun if the parameter is
-                             # the proc's return value
-    isInferred,              # generic proc was matched against a concrete type
-    isInferredConvertible,   # same as above, but requiring proc CC conversion
-    isGeneric,
-    isFromIntLit,            # conversion *from* int literal; proven safe
-    isEqual
 
 const
   isNilConversion = isConvertible # maybe 'isIntConv' fits better?
@@ -260,7 +245,7 @@ proc sumGeneric(t: PType): int =
     of tyGenericParam, tyUntyped, tyTyped: break
     of tyAlias, tySink: t = t.lastSon
     of tyBool, tyChar, tyEnum, tyObject, tyPointer,
-        tyString, tyCString, tyInt..tyInt64, tyFloat..tyFloat128,
+        tyString, tyCstring, tyInt..tyInt64, tyFloat..tyFloat128,
         tyUInt..tyUInt64, tyCompositeTypeClass:
       return isvar
     else:
@@ -363,7 +348,7 @@ proc concreteType(c: TCandidate, t: PType; f: PType = nil): PType =
   of tySequence, tySet:
     if t[0].kind == tyEmpty: result = nil
     else: result = t
-  of tyGenericParam, tyAnything:
+  of tyGenericParam, tyAnything, tyConcept:
     result = t
     while true:
       result = PType(idTableGet(c.bindings, t))
@@ -409,7 +394,7 @@ proc handleRange(f, a: PType, min, max: TTypeKind): TTypeRelation =
     elif a.kind == tyRange and
       # Make sure the conversion happens between types w/ same signedness
       (f.kind in {tyInt..tyInt64} and a[0].kind in {tyInt..tyInt64} or
-       f.kind in {tyUInt8..tyUInt32} and a[0].kind in {tyUInt8..tyInt32}) and
+       f.kind in {tyUInt8..tyUInt32} and a[0].kind in {tyUInt8..tyUInt32}) and
       a.n[0].intVal >= firstOrd(nil, f) and a.n[1].intVal <= lastOrd(nil, f):
       # passing 'nil' to firstOrd/lastOrd here as type checking rules should
       # not depend on the target integer size configurations!
@@ -556,12 +541,6 @@ proc recordRel(c: var TCandidate, f, a: PType): TTypeRelation =
 proc allowsNil(f: PType): TTypeRelation {.inline.} =
   result = if tfNotNil notin f.flags: isSubtype else: isNone
 
-proc allowsNilDeprecated(c: TCandidate, f: PType): TTypeRelation =
-  if optNilSeqs in c.c.config.options:
-    result = allowsNil(f)
-  else:
-    result = isNone
-
 proc inconsistentVarTypes(f, a: PType): bool {.inline.} =
   result = f.kind != a.kind and
     (f.kind in {tyVar, tyLent, tySink} or a.kind in {tyVar, tyLent, tySink})
@@ -646,23 +625,9 @@ proc procTypeRel(c: var TCandidate, f, a: PType): TTypeRelation =
         return isNone
     elif a[0] != nil:
       return isNone
+    
+    result = getProcConvMismatch(c.c.config, f, a, result)[1]
 
-    if tfNoSideEffect in f.flags and tfNoSideEffect notin a.flags:
-      return isNone
-    elif tfThread in f.flags and a.flags * {tfThread, tfNoSideEffect} == {} and
-        optThreadAnalysis in c.c.config.globalOptions:
-      # noSideEffect implies ``tfThread``!
-      return isNone
-    elif f.flags * {tfIterator} != a.flags * {tfIterator}:
-      return isNone
-    elif f.callConv != a.callConv:
-      # valid to pass a 'nimcall' thingie to 'closure':
-      if f.callConv == ccClosure and a.callConv == ccNimCall:
-        result = if result == isInferred: isInferredConvertible
-                 elif result == isBothMetaConvertible: isBothMetaConvertible
-                 else: isConvertible
-      else:
-        return isNone
     when useEffectSystem:
       if compatibleEffects(f, a) != efCompat: return isNone
     when defined(drnim):
@@ -1017,7 +982,7 @@ proc typeRel(c: var TCandidate, f, aOrig: PType,
   when declared(deallocatedRefId):
     let corrupt = deallocatedRefId(cast[pointer](f))
     if corrupt != 0:
-      quit "it's corrupt " & $corrupt
+      c.c.config.quitOrRaise "it's corrupt " & $corrupt
 
   if f.kind == tyUntyped:
     if aOrig != nil: put(c, f, aOrig)
@@ -1125,6 +1090,8 @@ proc typeRel(c: var TCandidate, f, aOrig: PType,
         return if x >= isGeneric: isGeneric else: x
     return isNone
 
+  of tyIterable:
+    if f.kind != tyIterable: return isNone
   of tyNot:
     case f.kind
     of tyNot:
@@ -1300,7 +1267,7 @@ proc typeRel(c: var TCandidate, f, aOrig: PType,
             result = isNone
         elif tfNotNil in f.flags and tfNotNil notin a.flags:
           result = isNilConversion
-    of tyNil: result = allowsNilDeprecated(c, f)
+    of tyNil: result = isNone
     else: discard
   of tyOrdinal:
     if isOrdinalType(a, allowEnumWithHoles = optNimV1Emulation in c.c.config.globalOptions):
@@ -1345,8 +1312,13 @@ proc typeRel(c: var TCandidate, f, aOrig: PType,
         result = isSubtype
       else:
         result = typeRel(c, f[0], a[0], flags)
-        if result <= isConvertible:
-          result = isNone     # BUGFIX!
+        if result < isGeneric:
+          if result <= isConvertible:
+            result = isNone
+          elif tfIsConstructor notin a.flags:
+            # set constructors are a bit special...
+            result = isNone
+
   of tyPtr, tyRef:
     skipOwned(a)
     if a.kind == f.kind:
@@ -1387,7 +1359,7 @@ proc typeRel(c: var TCandidate, f, aOrig: PType,
       # 'pointer' is NOT compatible to regionized pointers
       # so 'dealloc(regionPtr)' fails:
       if a.len == 1: result = isConvertible
-    of tyCString: result = isConvertible
+    of tyCstring: result = isConvertible
     else: discard
   of tyString:
     case a.kind
@@ -1396,12 +1368,12 @@ proc typeRel(c: var TCandidate, f, aOrig: PType,
         result = isNilConversion
       else:
         result = isEqual
-    of tyNil: result = allowsNilDeprecated(c, f)
+    of tyNil: result = isNone
     else: discard
-  of tyCString:
+  of tyCstring:
     # conversion from string to cstring is automatic:
     case a.kind
-    of tyCString:
+    of tyCstring:
       if tfNotNil in f.flags and tfNotNil notin a.flags:
         result = isNilConversion
       else:
@@ -1427,6 +1399,15 @@ proc typeRel(c: var TCandidate, f, aOrig: PType,
   of tyAlias, tySink:
     result = typeRel(c, lastSon(f), a, flags)
 
+  of tyIterable:
+    if a.kind == tyIterable:
+      if f.len == 1:
+        result = typeRel(c, lastSon(f), lastSon(a), flags)
+      else:
+        # f.len = 3, for some reason
+        result = isGeneric
+    else:
+      result = isNone
   of tyGenericInst:
     var prev = PType(idTableGet(c.bindings, f))
     let origF = f
@@ -1505,8 +1486,8 @@ proc typeRel(c: var TCandidate, f, aOrig: PType,
 
   of tyGenericInvocation:
     var x = a.skipGenericAlias
-
-    var preventHack = false
+    let concpt = f[0].skipTypes({tyGenericBody})
+    var preventHack = concpt.kind == tyConcept
     if x.kind == tyOwned and f[0].kind != tyOwned:
       preventHack = true
       x = x.lastSon
@@ -1533,6 +1514,9 @@ proc typeRel(c: var TCandidate, f, aOrig: PType,
           # Workaround for regression #4589
           if f[i].kind != tyTypeDesc: return
       result = isGeneric
+    elif x.kind == tyGenericInst and concpt.kind == tyConcept:
+      result = if concepts.conceptMatch(c.c, concpt, x, c.bindings, f): isGeneric
+               else: isNone
     else:
       let genericBody = f[0]
       var askip = skippedNone
@@ -1653,6 +1637,10 @@ proc typeRel(c: var TCandidate, f, aOrig: PType,
           result = isGeneric
         else:
           result = isNone
+
+  of tyConcept:
+    result = if concepts.conceptMatch(c.c, f, a, c.bindings, nil): isGeneric
+             else: isNone
 
   of tyCompositeTypeClass:
     considerPreviousT:
@@ -2269,14 +2257,18 @@ proc prepareOperand(c: PContext; formal: PType; a: PNode): PNode =
     # a.typ == nil is valid
     result = a
   elif a.typ.isNil:
-    # XXX This is unsound! 'formal' can differ from overloaded routine to
-    # overloaded routine!
-    let flags = {efDetermineType, efAllowStmt}
-                #if formal.kind == tyIter: {efDetermineType, efWantIterator}
-                #else: {efDetermineType, efAllowStmt}
-                #elif formal.kind == tyTyped: {efDetermineType, efWantStmt}
-                #else: {efDetermineType}
-    result = c.semOperand(c, a, flags)
+    if formal.kind == tyIterable:
+      let flags = {efDetermineType, efAllowStmt, efWantIterator, efWantIterable}
+      result = c.semOperand(c, a, flags)
+    else:
+      # XXX This is unsound! 'formal' can differ from overloaded routine to
+      # overloaded routine!
+      let flags = {efDetermineType, efAllowStmt}
+                  #if formal.kind == tyIterable: {efDetermineType, efWantIterator}
+                  #else: {efDetermineType, efAllowStmt}
+                  #elif formal.kind == tyTyped: {efDetermineType, efWantStmt}
+                  #else: {efDetermineType}
+      result = c.semOperand(c, a, flags)
   else:
     result = a
     considerGenSyms(c, result)
@@ -2420,7 +2412,7 @@ proc matchesAux(c: PContext, n, nOrig: PNode, m: var TCandidate, marker: var Int
           n[a] = prepareOperand(c, n[a])
           if skipTypes(n[a].typ, abstractVar-{tyTypeDesc}).kind==tyString:
             m.call.add implicitConv(nkHiddenStdConv,
-                  getSysType(c.graph, n[a].info, tyCString),
+                  getSysType(c.graph, n[a].info, tyCstring),
                   copyTree(n[a]), m, c)
           else:
             m.call.add copyTree(n[a])
@@ -2500,7 +2492,7 @@ proc matchesAux(c: PContext, n, nOrig: PNode, m: var TCandidate, marker: var Int
             noMatch()
         checkConstraint(n[a])
 
-    if m.state == csMatch and not(m.calleeSym != nil and m.calleeSym.kind in {skTemplate, skMacro}):
+    if m.state == csMatch and not (m.calleeSym != nil and m.calleeSym.kind in {skTemplate, skMacro}):
       c.mergeShadowScope
     else:
       c.closeShadowScope

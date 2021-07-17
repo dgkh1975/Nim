@@ -292,7 +292,7 @@ proc markAsClosure(g: ModuleGraph; owner: PSym; n: PNode) =
   if illegalCapture(s):
     localError(g.config, n.info,
       ("'$1' is of type <$2> which cannot be captured as it would violate memory" &
-       " safety, declared here: $3; using '-d:nimWorkaround14447' helps in some cases") %
+       " safety, declared here: $3; using '-d:nimNoLentIterators' helps in some cases") %
       [s.name.s, typeToString(s.typ), g.config$s.info])
   elif not (owner.typ.callConv == ccClosure or owner.typ.callConv == ccNimCall and tfExplicitCallConv notin owner.typ.flags):
     localError(g.config, n.info, "illegal capture '$1' because '$2' has the calling convention: <$3>" %
@@ -497,7 +497,8 @@ proc detectCapturedVars(n: PNode; owner: PSym; c: var DetectionPass) =
           w = up
   of nkEmpty..pred(nkSym), succ(nkSym)..nkNilLit,
      nkTemplateDef, nkTypeSection, nkProcDef, nkMethodDef,
-     nkConverterDef, nkMacroDef, nkFuncDef, nkCommentStmt, nkTypeOfExpr:
+     nkConverterDef, nkMacroDef, nkFuncDef, nkCommentStmt,
+     nkTypeOfExpr, nkMixinStmt, nkBindStmt:
     discard
   of nkLambdaKinds, nkIteratorDef:
     if n.typ != nil:
@@ -752,7 +753,7 @@ proc liftCapturedVars(n: PNode; owner: PSym; d: var DetectionPass;
         result = accessViaEnvVar(n, owner, d, c)
   of nkEmpty..pred(nkSym), succ(nkSym)..nkNilLit, nkComesFrom,
      nkTemplateDef, nkTypeSection, nkProcDef, nkMethodDef, nkConverterDef,
-     nkMacroDef, nkFuncDef:
+     nkMacroDef, nkFuncDef, nkMixinStmt, nkBindStmt:
     discard
   of nkClosure:
     if n[1].kind == nkNilLit:

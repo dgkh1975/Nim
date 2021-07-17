@@ -196,13 +196,11 @@ type
     cpuSparc64, cpuMips64, cpuMips64el, cpuRiscV32, cpuRiscV64, cpuEsp, cpuWasm32
 
 type
-  TEndian* = enum
-    littleEndian, bigEndian
-  TInfoCPU* = tuple[name: string, intSize: int, endian: TEndian,
+  TInfoCPU* = tuple[name: string, intSize: int, endian: Endianness,
                     floatSize, bit: int]
 
 const
-  EndianToStr*: array[TEndian, string] = ["littleEndian", "bigEndian"]
+  EndianToStr*: array[Endianness, string] = ["littleEndian", "bigEndian"]
   CPU*: array[succ(low(TSystemCPU))..high(TSystemCPU), TInfoCPU] = [
     (name: "i386", intSize: 32, endian: littleEndian, floatSize: 64, bit: 32),
     (name: "m68k", intSize: 32, endian: bigEndian, floatSize: 64, bit: 32),
@@ -219,7 +217,7 @@ const
     (name: "mipsel", intSize: 32, endian: littleEndian, floatSize: 64, bit: 32),
     (name: "arm", intSize: 32, endian: littleEndian, floatSize: 64, bit: 32),
     (name: "arm64", intSize: 64, endian: littleEndian, floatSize: 64, bit: 64),
-    (name: "js", intSize: 32, endian: bigEndian,floatSize: 64,bit: 32),
+    (name: "js", intSize: 32, endian: littleEndian, floatSize: 64, bit: 32),
     (name: "nimvm", intSize: 32, endian: bigEndian, floatSize: 64, bit: 32),
       # xxx this seems buggy; on a 64bit machine, sizeof(int) is 64 in nimvm.
     (name: "avr", intSize: 16, endian: littleEndian, floatSize: 32, bit: 16),

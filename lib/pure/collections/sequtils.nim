@@ -39,7 +39,7 @@
 ## `method call syntax<manual.html#procedures-method-call-syntax>`_.
 
 runnableExamples:
-  import sugar
+  import std/sugar
 
   # Creating a sequence from 1 to 10, multiplying each member by 2,
   # keeping only the members which are not divisible by 6.
@@ -62,7 +62,7 @@ runnableExamples:
 
 
 runnableExamples:
-  from strutils import join
+  from std/strutils import join
 
   let
     vowels = @"aeiou"
@@ -83,10 +83,6 @@ runnableExamples:
 import std/private/since
 
 import macros
-
-when not defined(nimhygiene):
-  {.pragma: dirty.}
-
 
 macro evalOnceAs(expAlias, exp: untyped,
                  letAssigneable: static[bool]): untyped =
@@ -330,7 +326,6 @@ func distribute*[T](s: seq[T], num: Positive, spread = true): seq[seq[T]] =
   if num < 2:
     result = @[s]
     return
-  let num = int(num) # XXX probably only needed because of .. bug
 
   # Create the result and calculate the stride size and the remainder if any.
   result = newSeq[seq[T]](num)
@@ -443,7 +438,7 @@ iterator filter*[T](s: openArray[T], pred: proc(x: T): bool {.closure.}): T =
   ##
   ## **See also:**
   ## * `sugar.collect macro<sugar.html#collect.m%2Cuntyped%2Cuntyped>`_
-  ## * `fliter proc<#filter,openArray[T],proc(T)>`_
+  ## * `filter proc<#filter,openArray[T],proc(T)>`_
   ## * `filterIt template<#filterIt.t,untyped,untyped>`_
   ##
   runnableExamples:
@@ -514,12 +509,51 @@ proc keepIf*[T](s: var seq[T], pred: proc(x: T): bool {.closure.})
       inc(pos)
   setLen(s, pos)
 
-func delete*[T](s: var seq[T]; first, last: Natural) =
+func delete*[T](s: var seq[T]; slice: Slice[int]) =
+  ## Deletes the items `s[slice]`, raising `IndexDefect` if the slice contains
+  ## elements out of range.
+  ##
+  ## This operation moves all elements after `s[slice]` in linear time.
+  runnableExamples:
+    var a = @[10, 11, 12, 13, 14]
+    doAssertRaises(IndexDefect): a.delete(4..5)
+    assert a == @[10, 11, 12, 13, 14]
+    a.delete(4..4)
+    assert a == @[10, 11, 12, 13]
+    a.delete(1..2)
+    assert a == @[10, 13]
+    a.delete(1..<1) # empty slice
+    assert a == @[10, 13]
+  when compileOption("boundChecks"):
+    if not (slice.a < s.len and slice.a >= 0 and slice.b < s.len):
+      raise newException(IndexDefect, $(slice: slice, len: s.len))
+  if slice.b >= slice.a:
+    template defaultImpl =
+      var i = slice.a
+      var j = slice.b + 1
+      var newLen = s.len - j + i
+      while i < newLen:
+        when defined(gcDestructors):
+          s[i] = move(s[j])
+        else:
+          s[i].shallowCopy(s[j])
+        inc(i)
+        inc(j)
+      setLen(s, newLen)
+    when nimvm: defaultImpl()
+    else:
+      when defined(js):
+        let n = slice.b - slice.a + 1
+        let first = slice.a
+        {.emit: "`s`.splice(`first`, `n`);".}
+      else:
+        defaultImpl()
+
+func delete*[T](s: var seq[T]; first, last: Natural) {.deprecated: "use `delete(s, first..last)`".} =
   ## Deletes the items of a sequence `s` at positions `first..last`
   ## (including both ends of the range).
   ## This modifies `s` itself, it does not return a copy.
-  ##
-  runnableExamples:
+  runnableExamples("--warning:deprecated:off"):
     let outcome = @[1, 1, 1, 1, 1, 1, 1, 1]
     var dest = @[1, 1, 1, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1]
     dest.delete(3, 8)
@@ -587,7 +621,7 @@ template filterIt*(s, pred: untyped): untyped =
   ##
   ## **See also:**
   ## * `sugar.collect macro<sugar.html#collect.m%2Cuntyped%2Cuntyped>`_
-  ## * `fliter proc<#filter,openArray[T],proc(T)>`_
+  ## * `filter proc<#filter,openArray[T],proc(T)>`_
   ## * `filter iterator<#filter.i,openArray[T],proc(T)>`_
   ##
   runnableExamples:
@@ -956,16 +990,10 @@ template mapIt*(s: typed, op: untyped): untyped =
       strings = nums.mapIt($(4 * it))
     assert strings == @["4", "8", "12", "16"]
 
-  when defined(nimHasTypeof):
-    type OutType = typeof((
-      block:
-        var it{.inject.}: typeof(items(s), typeOfIter);
-        op), typeOfProc)
-  else:
-    type OutType = typeof((
-      block:
-        var it{.inject.}: typeof(items(s));
-        op))
+  type OutType = typeof((
+    block:
+      var it{.inject.}: typeof(items(s), typeOfIter);
+      op), typeOfProc)
   when OutType is not (proc):
     # Here, we avoid to create closures in loops.
     # This avoids https://github.com/nim-lang/Nim/issues/12625
@@ -996,11 +1024,7 @@ template mapIt*(s: typed, op: untyped): untyped =
     # With this fallback, above code can be simplified to:
     #   [1, 2].mapIt((x: int) => it + x)
     # In this case, `mapIt` is just syntax sugar for `map`.
-
-    when defined(nimHasTypeof):
-      type InType = typeof(items(s), typeOfIter)
-    else:
-      type InType = typeof(items(s))
+    type InType = typeof(items(s), typeOfIter)
     # Use a help proc `f` to create closures for each element in `s`
     let f = proc (x: InType): OutType =
               let it {.inject.} = x
@@ -1029,27 +1053,27 @@ template applyIt*(varSeq, op: untyped) =
 
 
 template newSeqWith*(len: int, init: untyped): untyped =
-  ## Creates a new sequence of length `len`, calling `init` to initialize
-  ## each value of the sequence.
+  ## Creates a new `seq` of length `len`, calling `init` to initialize
+  ## each value of the seq.
   ##
-  ## Useful for creating "2D" sequences - sequences containing other sequences
-  ## or to populate fields of the created sequence.
-  ##
+  ## Useful for creating "2D" seqs - seqs containing other seqs
+  ## or to populate fields of the created seq.
   runnableExamples:
-    ## Creates a sequence containing 5 bool sequences, each of length of 3.
+    ## Creates a seq containing 5 bool seqs, each of length of 3.
     var seq2D = newSeqWith(5, newSeq[bool](3))
     assert seq2D.len == 5
     assert seq2D[0].len == 3
     assert seq2D[4][2] == false
 
-    ## Creates a sequence of 20 random numbers from 1 to 10
-    import random
-    var seqRand = newSeqWith(20, rand(10))
+    ## Creates a seq with random numbers
+    import std/random
+    var seqRand = newSeqWith(20, rand(1.0))
+    assert seqRand[0] != seqRand[1]
 
   var result = newSeq[typeof(init)](len)
   for i in 0 ..< len:
     result[i] = init
-  result
+  move(result) # refs bug #7295
 
 func mapLitsImpl(constructor: NimNode; op: NimNode; nested: bool;
                  filter = nnkLiterals): NimNode =
