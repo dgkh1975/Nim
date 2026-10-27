@@ -12,10 +12,9 @@
 ##
 ## It can be used to parse a wild HTML document and output it as valid XHTML
 ## document (well, if you are lucky):
-##
-## .. code-block:: Nim
-##
+##   ```Nim
 ##   echo loadHtml("mydirty.html")
+##   ```
 ##
 ## Every tag in the resulting tree is in lower case.
 ##
@@ -29,9 +28,7 @@
 ## and write back the modified version. In this case we look for hyperlinks
 ## ending with the extension `.rst` and convert them to `.html`.
 ##
-## .. code-block:: Nim
-##     :test:
-##
+##   ```Nim test
 ##   import std/htmlparser
 ##   import std/xmltree  # To use '$' for XmlNode
 ##   import std/strtabs  # To access XmlAttributes
@@ -48,8 +45,14 @@
 ##           a.attrs["href"] = dir / filename & ".html"
 ##
 ##     writeFile("output.html", $html)
+##   ```
 
-import strutils, streams, parsexml, xmltree, unicode, strtabs
+{.deprecated: "use `nimble install htmlparser` and import `pkg/htmlparser` instead".}
+
+import std/[strutils, streams, parsexml, xmltree, unicode, strtabs]
+
+when defined(nimPreviewSlimSystem):
+  import std/syncio
 
 type
   HtmlTag* = enum  ## list of all supported HTML tags; order will always be
@@ -391,10 +394,10 @@ proc entityToRune*(entity: string): Rune =
     case entity[1]
     of '0'..'9':
       try: runeValue = parseInt(entity[1..^1])
-      except: discard
+      except ValueError: discard
     of 'x', 'X': # not case sensitive here
       try: runeValue = parseHexInt(entity[2..^1])
-      except: discard
+      except ValueError: discard
     else: discard # other entities are not defined with prefix `#`
     if runeValue notin 0..0x10FFFF: runeValue = 0 # only return legal values
     return Rune(runeValue)
@@ -1893,7 +1896,12 @@ proc entityToUtf8*(entity: string): string =
 proc addNode(father, son: XmlNode) =
   if son != nil: add(father, son)
 
-proc parse(x: var XmlParser, errors: var seq[string]): XmlNode {.gcsafe.}
+const
+  htmlMaxDepth* {.intdefine.} = 512 ## The maximum nesting depth of elements.
+    ## Elements nested deeper become siblings instead, like in browsers.
+    ## This can be set on the command line via `-d:htmlMaxDepth=N`.
+
+proc parse(x: var XmlParser, errors: var seq[string]; depth: int): XmlNode {.gcsafe.}
 
 proc expected(x: var XmlParser, n: XmlNode): string =
   result = errorMsg(x, "</" & n.tag & "> expected")
@@ -1904,7 +1912,7 @@ template adderr(x: untyped) =
   errors.add(x)
 
 proc untilElementEnd(x: var XmlParser, result: XmlNode,
-                     errors: var seq[string]) =
+                     errors: var seq[string]; depth: int) =
   # we parsed e.g. `<br>` and don't really expect a `</br>`:
   if result.htmlTag in SingleTags:
     if x.kind != xmlElementEnd or cmpIgnoreCase(x.elemName, result.tag) != 0:
@@ -1938,7 +1946,7 @@ proc untilElementEnd(x: var XmlParser, result: XmlNode,
           adderr(expected(x, result))
           break
       else: discard
-      result.addNode(parse(x, errors))
+      result.addNode(parse(x, errors, depth))
     of xmlElementEnd:
       if cmpIgnoreCase(x.elemName, result.tag) != 0:
         #echo "5; expected: ", result.htmltag, " ", x.elemName
@@ -1955,9 +1963,22 @@ proc untilElementEnd(x: var XmlParser, result: XmlNode,
       adderr(expected(x, result))
       break
     else:
-      result.addNode(parse(x, errors))
+      result.addNode(parse(x, errors, depth))
 
-proc parse(x: var XmlParser, errors: var seq[string]): XmlNode =
+proc childrenOf(x: var XmlParser, result: XmlNode,
+                errors: var seq[string]; depth: int) =
+  ## Parses the children of `result`, unless that is nested too deeply.
+  ## Like browsers do, the children of an element at the maximum depth
+  ## become its siblings then, which keeps the recursion bounded.
+  if depth < htmlMaxDepth:
+    untilElementEnd(x, result, errors, depth+1)
+  else:
+    const msg = "elements nested too deeply"
+    if errors.len == 0 or not errors[^1].endsWith(msg):
+      adderr(errorMsg(x, msg))
+
+proc parse(x: var XmlParser, errors: var seq[string]; depth: int): XmlNode =
+  result = nil
   case x.kind
   of xmlComment:
     result = newComment(x.rawData)
@@ -1974,7 +1995,7 @@ proc parse(x: var XmlParser, errors: var seq[string]): XmlNode =
   of xmlElementStart:
     result = newElement(toLowerAscii(x.elemName))
     next(x)
-    untilElementEnd(x, result, errors)
+    childrenOf(x, result, errors, depth)
   of xmlElementEnd:
     adderr(errorMsg(x, "unexpected ending tag: " & x.elemName))
   of xmlElementOpen:
@@ -1997,7 +2018,7 @@ proc parse(x: var XmlParser, errors: var seq[string]): XmlNode =
         adderr(errorMsg(x, "'>' expected"))
         next(x)
         break
-    untilElementEnd(x, result, errors)
+    childrenOf(x, result, errors, depth)
   of xmlAttribute, xmlElementClose:
     adderr(errorMsg(x, "<some_tag> expected"))
     next(x)
@@ -2014,7 +2035,7 @@ proc parseHtml*(s: Stream, filename: string,
                 errors: var seq[string]): XmlNode =
   ## Parses the XML from stream `s` and returns a `XmlNode`. Every
   ## occurred parsing error is added to the `errors` sequence.
-  var x: XmlParser
+  var x: XmlParser = default(XmlParser)
   open(x, s, filename, {reportComments, reportWhitespace, allowUnquotedAttribs,
     allowEmptyAttribs})
   next(x)
@@ -2022,12 +2043,12 @@ proc parseHtml*(s: Stream, filename: string,
   if x.kind == xmlSpecial: next(x)
 
   result = newElement("document")
-  result.addNode(parse(x, errors))
+  result.addNode(parse(x, errors, 0))
   #if x.kind != xmlEof:
   #  adderr(errorMsg(x, "EOF expected"))
   while x.kind != xmlEof:
     var oldPos = x.bufpos # little hack to see if we made any progress
-    result.addNode(parse(x, errors))
+    result.addNode(parse(x, errors, 0))
     if x.bufpos == oldPos:
       # force progress!
       next(x)
@@ -2061,7 +2082,7 @@ proc loadHtml*(path: string): XmlNode =
   result = loadHtml(path, errors)
 
 when not defined(testing) and isMainModule:
-  import os
+  import std/os
 
   var errors: seq[string] = @[]
   var x = loadHtml(paramStr(1), errors)

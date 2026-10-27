@@ -1,11 +1,12 @@
 # this module avoids ast depending on msgs or vice versa
 import std/strutils
 import options, ast, msgs
+from astalgo import isSumTypeDiscriminator
 
 proc typSym*(t: PType): PSym =
   result = t.sym
   if result == nil and t.kind == tyGenericInst: # this might need to be refined
-    result = t[0].sym
+    result = t.genericHead.sym
 
 proc addDeclaredLoc*(result: var string, conf: ConfigRef; sym: PSym) =
   result.add " [$1 declared in $2]" % [sym.kind.toHumanStr, toFileLineCol(conf, sym.info)]
@@ -24,6 +25,12 @@ proc addDeclaredLoc*(result: var string, conf: ConfigRef; typ: PType) =
     result.add " declared in " & toFileLineCol(conf, typ.sym.info)
   result.add "]"
 
+proc addTypeNodeDeclaredLoc*(result: var string, conf: ConfigRef; typ: PType) =
+  result.add " [$1" % typ.kind.toHumanStr
+  if typ.sym != nil:
+    result.add " declared in " & toFileLineCol(conf, typ.sym.info)
+  result.add "]"
+
 proc addDeclaredLocMaybe*(result: var string, conf: ConfigRef; typ: PType) =
   if optDeclaredLocs in conf.globalOptions: addDeclaredLoc(result, conf, typ)
 
@@ -34,6 +41,10 @@ template quoteExpr*(a: string): untyped =
 proc genFieldDefect*(conf: ConfigRef, field: string, disc: PSym): string =
   let obj = disc.owner.name.s # `types.typeToString` might be better, eg for generics
   result = "field '$#' is not accessible for type '$#'" % [field, obj]
+  if isSumTypeDiscriminator(disc):
+    # the value of the hidden discriminator follows:
+    result.add " in branch '"
+    return
   if optDeclaredLocs in conf.globalOptions:
     result.add " [discriminant declared in $#]" % toFileLineCol(conf, disc.info)
   result.add " using '$# = " % disc.name.s

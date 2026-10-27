@@ -1,0 +1,140 @@
+#
+#
+#            Nim's Runtime Library
+#        (c) Copyright 2026 Andreas Rumpf
+#
+#    See the file "copying.txt", included in this
+#    distribution, for details about the copyright.
+#
+
+# Read-write lock (RwLock) for lib/system.
+# Used by YRC and by traceable containers that perform topology-changing ops.
+# POSIX: pthread_rwlock_* ; Windows: SRWLOCK (slim reader/writer).
+
+{.push stackTrace: off.}
+
+when defined(windows):
+  # SRWLOCK is pointer-sized; use single pointer for ABI compatibility
+  type
+    RwLock* {.importc: "SRWLOCK", header: "<synchapi.h>", final, pure, byref.} = object
+      p: pointer
+
+  # Older MinGW targets hide these declarations behind _WIN32_WINNT >= 0x0600.
+  # Emit the prototypes ourselves, including the Windows calling convention.
+  proc initializeSRWLock(L: ptr RwLock) {.stdcall, importc: "InitializeSRWLock".}
+  proc acquireSRWLockShared(L: ptr RwLock) {.stdcall, importc: "AcquireSRWLockShared".}
+  proc releaseSRWLockShared(L: ptr RwLock) {.stdcall, importc: "ReleaseSRWLockShared".}
+  proc acquireSRWLockExclusive(L: ptr RwLock) {.stdcall, importc: "AcquireSRWLockExclusive".}
+  proc releaseSRWLockExclusive(L: ptr RwLock) {.stdcall, importc: "ReleaseSRWLockExclusive".}
+
+  proc initRwLock*(L: var RwLock) {.inline.} =
+    initializeSRWLock(addr L)
+  proc deinitRwLock*(L: var RwLock) {.inline.} =
+    discard
+  proc acquireRead*(L: var RwLock) {.inline.} =
+    acquireSRWLockShared(addr L)
+  proc releaseRead*(L: var RwLock) {.inline.} =
+    releaseSRWLockShared(addr L)
+  proc acquireWrite*(L: var RwLock) {.inline.} =
+    acquireSRWLockExclusive(addr L)
+  proc releaseWrite*(L: var RwLock) {.inline.} =
+    releaseSRWLockExclusive(addr L)
+
+elif defined(genode):
+  {.error: "RwLock is not implemented for Genode".}
+
+else:
+  # POSIX: pthread_rwlock_*
+  type
+    SysRwLockObj {.importc: "pthread_rwlock_t", pure, final,
+                  header: """#include <sys/types.h>
+                             #include <pthread.h>""", byref.} = object
+      when defined(linux) and defined(amd64):
+        abi: array[56 div sizeof(clong), clong]
+    SysRwLockAttr {.importc: "pthread_rwlockattr_t", pure, final,
+                    header: "<pthread.h>".} = object
+
+  proc pthread_rwlock_init(rwlock: var SysRwLockObj,
+                          attr: ptr SysRwLockAttr): cint {.
+    importc: "pthread_rwlock_init", header: "<pthread.h>", noSideEffect.}
+  proc pthread_rwlock_destroy(rwlock: var SysRwLockObj): cint {.
+    importc: "pthread_rwlock_destroy", header: "<pthread.h>", noSideEffect.}
+  proc pthread_rwlock_rdlock(rwlock: var SysRwLockObj): cint {.
+    importc: "pthread_rwlock_rdlock", header: "<pthread.h>", noSideEffect.}
+  proc pthread_rwlock_wrlock(rwlock: var SysRwLockObj): cint {.
+    importc: "pthread_rwlock_wrlock", header: "<pthread.h>", noSideEffect.}
+  proc pthread_rwlock_unlock(rwlock: var SysRwLockObj): cint {.
+    importc: "pthread_rwlock_unlock", header: "<pthread.h>", noSideEffect.}
+
+  when defined(linux) and not (defined(musl) or defined(android)):
+    var preferWriter {.importc: "PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP",
+                        header: "<pthread.h>".}: cint
+    proc pthread_rwlockattr_init(attr: ptr SysRwLockAttr): cint {.
+      importc: "pthread_rwlockattr_init", header: "<pthread.h>".}
+    proc pthread_rwlockattr_destroy(attr: ptr SysRwLockAttr): cint {.
+      importc: "pthread_rwlockattr_destroy", header: "<pthread.h>".}
+    proc pthread_rwlockattr_setkind_np(attr: ptr SysRwLockAttr,
+                                     preference: cint): cint {.
+      importc: "pthread_rwlockattr_setkind_np", header: "<pthread.h>".}
+      ## Sets the native read/write lock preference.
+
+  when defined(ios):
+    type RwLock* = ptr SysRwLockObj
+    proc initRwLock*(L: var RwLock) =
+      when not declared(c_malloc):
+        proc c_malloc(size: csize_t): pointer {.importc: "malloc", header: "<stdlib.h>".}
+        proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>".}
+      L = cast[RwLock](c_malloc(csize_t(sizeof(SysRwLockObj))))
+      discard pthread_rwlock_init(L[], nil)
+    proc deinitRwLock*(L: var RwLock) =
+      if L != nil:
+        discard pthread_rwlock_destroy(L[])
+        when not declared(c_free):
+          proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>".}
+        c_free(L)
+        L = nil
+    proc acquireRead*(L: var RwLock) =
+      discard pthread_rwlock_rdlock(L[])
+    proc releaseRead*(L: var RwLock) =
+      discard pthread_rwlock_unlock(L[])
+    proc acquireWrite*(L: var RwLock) =
+      discard pthread_rwlock_wrlock(L[])
+    proc releaseWrite*(L: var RwLock) =
+      discard pthread_rwlock_unlock(L[])
+  else:
+    type RwLock* = SysRwLockObj
+    proc initRwLock*(L: var RwLock) =
+      when defined(linux) and not (defined(musl) or defined(android)):
+        var attr: SysRwLockAttr
+        discard pthread_rwlockattr_init(addr attr)
+        discard pthread_rwlockattr_setkind_np(addr attr, preferWriter)
+        discard pthread_rwlock_init(L, addr attr)
+        discard pthread_rwlockattr_destroy(addr attr)
+      else:
+        discard pthread_rwlock_init(L, nil)
+    proc deinitRwLock*(L: var RwLock) =
+      discard pthread_rwlock_destroy(L)
+    proc acquireRead*(L: var RwLock) =
+      discard pthread_rwlock_rdlock(L)
+    proc releaseRead*(L: var RwLock) =
+      discard pthread_rwlock_unlock(L)
+    proc acquireWrite*(L: var RwLock) =
+      discard pthread_rwlock_wrlock(L)
+    proc releaseWrite*(L: var RwLock) =
+      discard pthread_rwlock_unlock(L)
+
+template withReadLock*(L: var RwLock, body: untyped) =
+  acquireRead(L)
+  try:
+    body
+  finally:
+    releaseRead(L)
+
+template withWriteLock*(L: var RwLock, body: untyped) =
+  acquireWrite(L)
+  try:
+    body
+  finally:
+    releaseWrite(L)
+
+{.pop.}

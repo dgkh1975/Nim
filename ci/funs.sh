@@ -58,7 +58,11 @@ _nimNumCpu(){
   # FreeBSD | macOS: $(sysctl -n hw.ncpu)
   # OpenBSD: $(sysctl -n hw.ncpuonline)
   # windows: $NUMBER_OF_PROCESSORS ?
-  echo $(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || 1)
+  if env | grep -q '^NIMCORES='; then
+    echo $NIMCORES
+  else
+    echo $(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || 1)
+  fi
 }
 
 _nimBuildCsourcesIfNeeded(){
@@ -75,6 +79,8 @@ _nimBuildCsourcesIfNeeded(){
   elif [ "$unamestr" = 'NetBSD' ]; then
     makeX=gmake
   elif [ "$unamestr" = 'CROSSOS' ]; then
+    makeX=gmake
+  elif [ "$unamestr" = 'SunOS' ]; then
     makeX=gmake
   else
     makeX=make

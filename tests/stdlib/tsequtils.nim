@@ -1,4 +1,5 @@
 discard """
+  matrix: "--mm:refc; --mm:orc"
   targets: "c js"
 """
 
@@ -7,9 +8,11 @@ discard """
 import std/sequtils
 import strutils
 from algorithm import sorted
+import std/assertions
 
 {.experimental: "strictEffects".}
 {.push warningAsError[Effect]: on.}
+{.experimental: "strictFuncs".}
 
 # helper for testing double substitution side effects which are handled
 # by `evalOnceAs`
@@ -255,6 +258,17 @@ block: # any
   doAssert any(anumbers, proc (x: int): bool = return x > 8) == true
   doAssert any(anumbers, proc (x: int): bool = return x > 9) == false
 
+block: # findIt
+  let
+    numbers = @[1, 4, 5, 8, 9, 7, 4]
+    anumbers = [1, 4, 5, 8, 9, 7, 4]
+    len0seq: seq[int] = @[]
+  doAssert findIt(numbers, it == 4) == 1
+  doAssert findIt(numbers, it > 9) == -1
+  doAssert findIt(len0seq, true) == -1
+  doAssert findIt(anumbers, it > 8) == 4
+  doAssert findIt(anumbers, it > 9) == -1
+
 block: # anyIt
   let
     numbers = @[1, 4, 5, 8, 9, 7, 4]
@@ -272,7 +286,10 @@ block: # toSeq test
       numeric = @[1, 2, 3, 4, 5, 6, 7, 8, 9]
       oddNumbers = toSeq(filter(numeric) do (x: int) -> bool:
         if x mod 2 == 1:
-          result = true)
+          result = true
+        else:
+          result = false
+      )
     doAssert oddNumbers == @[1, 3, 5, 7, 9]
 
   block:
@@ -386,6 +403,11 @@ block: # newSeqWith tests
   seq2D[0][1] = true
   doAssert seq2D == @[@[true, true], @[true, false], @[false, false], @[false, false]]
 
+block: # bug #21538
+  var x: seq[int] = @[2, 4]
+  var y = newSeqWith(x.pop(), true)
+  doAssert y == @[true, true, true, true]
+
 block: # mapLiterals tests
   let x = mapLiterals([0.1, 1.2, 2.3, 3.4], int)
   doAssert x is array[4, int]
@@ -452,9 +474,34 @@ block:
       for i in 0..<len:
         yield i
 
+  # xxx: obscure CT error: basic_types.nim(16, 16) Error: internal error: symbol has no generated name: true
   when not defined(js):
-    # xxx: obscure CT error: basic_types.nim(16, 16) Error: internal error: symbol has no generated name: true
     doAssert: iter(3).mapIt(2*it).foldl(a + b) == 6
+
+block: # strictFuncs tests with ref object
+  type Foo = ref object
+
+  let foo1 = Foo()
+  let foo2 = Foo()
+  let foos = @[foo1, foo2]
+
+  # Procedures that are `func`
+  discard concat(foos, foos)
+  discard count(foos, foo1)
+  discard cycle(foos, 3)
+  discard deduplicate(foos)
+  discard minIndex(foos)
+  discard maxIndex(foos)
+  discard distribute(foos, 2)
+  var mutableFoos = foos
+  mutableFoos.delete(0..1)
+  mutableFoos.insert(foos)
+
+  # Some procedures that are `proc`, but were reverted from `func`
+  discard repeat(foo1, 3)
+  discard zip(foos, foos)
+  let fooTuples = @[(foo1, 1), (foo2, 2)]
+  discard unzip(fooTuples)
 
 template main =
   # xxx move all tests here

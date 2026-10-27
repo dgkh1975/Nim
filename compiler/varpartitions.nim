@@ -32,6 +32,9 @@ import ast, types, lineinfos, options, msgs, renderer, typeallowed, modulegraphs
 from trees import getMagic, isNoSideEffectPragma, stupidStmtListExpr
 from isolation_check import canAlias
 
+when defined(nimPreviewSlimSystem):
+  import std/assertions
+
 type
   AbstractTime = distinct int
 
@@ -79,6 +82,7 @@ type
     sym: PSym
     reassignedTo: int
     aliveStart, aliveEnd: AbstractTime # the range for which the variable is alive.
+    declScope: int # scope nesting depth of the variable's declaration
     borrowsFrom: seq[int] # indexes into Partitions.s
 
   MutationInfo* = object
@@ -95,12 +99,16 @@ type
 
   Partitions* = object
     abstractTime: AbstractTime
+    defers: seq[PNode]
+    processDefer: bool
     s: seq[VarIndex]
     graphs: seq[MutationInfo]
     goals: set[Goal]
     unanalysableMutation: bool
     inAsgnSource, inConstructor, inNoSideEffectSection: int
     inConditional, inLoop: int
+    inConvHasDestructor: int
+    scopeDepth: int # nesting depth of scopes that destroy their temporaries
     owner: PSym
     g: ModuleGraph
 
@@ -179,6 +187,9 @@ proc root(v: var Partitions; start: int): int =
 proc potentialMutation(v: var Partitions; s: PSym; level: int; info: TLineInfo) =
   let id = variableId(v, s)
   if id >= 0:
+    # mutated here => alive here: keep aliveEnd in sync so dangerousMutation catches
+    # mutations recorded after the var's last use (e.g. via a call arg). See #25595.
+    v.s[id].aliveEnd = max(v.s[id].aliveEnd, v.abstractTime)
     let r = root(v, id)
     let flags = if s.kind == skParam:
                   if isConstParam(s):
@@ -283,7 +294,9 @@ proc borrowFromConstExpr(n: PNode): bool =
       result = true
       for i in 1..<n.len:
         if not borrowFromConstExpr(n[i]): return false
-  else: discard
+    else:
+      result = false
+  else: result = false
 
 proc pathExpr(node: PNode; owner: PSym): PNode =
   #[ From the spec:
@@ -393,15 +406,14 @@ proc allRoots(n: PNode; result: var seq[(PSym, int)]; level: int) =
         if typ != nil:
           typ = skipTypes(typ, abstractInst)
           if typ.kind != tyProc: typ = nil
-          else: assert(typ.len == typ.n.len)
 
         for i in 1 ..< n.len:
           let it = n[i]
-          if typ != nil and i < typ.len:
+          if typ != nil and i < typ.n.len:
             assert(typ.n[i].kind == nkSym)
             let paramType = typ.n[i].typ
-            if not paramType.isCompileTimeOnly and not typ.sons[0].isEmptyType and
-                canAlias(paramType, typ.sons[0]):
+            if not paramType.isCompileTimeOnly and not typ.returnType.isEmptyType and
+                canAlias(paramType, typ.returnType):
               allRoots(it, result, RootEscapes)
           else:
             allRoots(it, result, RootEscapes)
@@ -413,6 +425,20 @@ proc allRoots(n: PNode; result: var seq[(PSym, int)]; level: int) =
   else:
     discard "nothing to do"
 
+proc isTemporary(n: PNode): bool =
+  ## Is the location 'n' (part of) a temporary produced by a call?
+  var n = n
+  while true:
+    case n.kind
+    of nkDotExpr, nkBracketExpr, nkCheckedFieldExpr, nkHiddenAddr, nkAddr,
+        nkObjUpConv, nkObjDownConv:
+      n = n[0]
+    of nkHiddenStdConv, nkHiddenSubConv, nkConv:
+      n = n[1]
+    else: break
+  result = n.kind in nkCallKinds and n.typ != nil and
+    n.typ.skipTypes(abstractInst).kind notin {tyVar, tyLent} and hasDestructor(n.typ)
+
 proc destMightOwn(c: var Partitions; dest: var VarIndex; n: PNode) =
   ## Analyse if 'n' is an expression that owns the data, if so mark 'dest'
   ## with 'ownsData'.
@@ -421,16 +447,28 @@ proc destMightOwn(c: var Partitions; dest: var VarIndex; n: PNode) =
     # primitive literals including the empty are harmless:
     discard
 
-  of nkExprEqExpr, nkExprColonExpr, nkHiddenStdConv, nkHiddenSubConv, nkCast, nkConv:
+  of nkExprEqExpr, nkExprColonExpr, nkHiddenStdConv, nkHiddenSubConv, nkCast:
     destMightOwn(c, dest, n[1])
+
+  of nkConv:
+    if hasDestructor(n.typ):
+      inc c.inConvHasDestructor
+      destMightOwn(c, dest, n[1])
+      dec c.inConvHasDestructor
+    else:
+      destMightOwn(c, dest, n[1])
 
   of nkIfStmt, nkIfExpr:
     for i in 0..<n.len:
+      inc c.inConditional
       destMightOwn(c, dest, n[i].lastSon)
+      dec c.inConditional
 
   of nkCaseStmt:
     for i in 1..<n.len:
+      inc c.inConditional
       destMightOwn(c, dest, n[i].lastSon)
+      dec c.inConditional
 
   of nkStmtList, nkStmtListExpr:
     if n.len > 0:
@@ -475,23 +513,38 @@ proc destMightOwn(c: var Partitions; dest: var VarIndex; n: PNode) =
 
   of nkCallKinds:
     if n.typ != nil:
-      if hasDestructor(n.typ):
+      if hasDestructor(n.typ) or c.inConvHasDestructor > 0:
         # calls do construct, what we construct must be destroyed,
         # so dest cannot be a cursor:
         dest.flags.incl ownsData
-      elif n.typ.kind in {tyLent, tyVar}:
+      elif n.typ.kind in {tyLent, tyVar} and n.len > 1:
         # we know the result is derived from the first argument:
-        var roots: seq[(PSym, int)]
+        var roots: seq[(PSym, int)] = @[]
         allRoots(n[1], roots, RootEscapes)
-        for r in roots:
-          connect(c, dest.sym, r[0], n[1].info)
+        if isTemporary(n[1]) and c.scopeDepth > dest.declScope:
+          # bug #26461: the temporary is destroyed at the end of the current
+          # scope but 'dest' lives longer than that:
+          dest.flags.incl preventCursor
+        elif roots.len == 0 and c.inConditional > 0:
+          # when in a conditional expression,
+          # to ensure that the first argument isn't outlived
+          # by the lvalue, we need find the root, otherwise
+          # it is probably a local temporary
+          # (e.g. a return value from a call),
+          # we should prevent cursorfication
+          dest.flags.incl preventCursor
+        else:
+          for r in roots:
+            connect(c, dest.sym, r[0], n[1].info)
 
       else:
         let magic = if n[0].kind == nkSym: n[0].sym.magic else: mNone
         # this list is subtle, we try to answer the question if after 'dest = f(src)'
         # there is a connection betwen 'src' and 'dest' so that mutations to 'src'
         # also reflect 'dest':
-        if magic in {mNone, mMove, mSlice, mAppendStrCh, mAppendStrStr, mAppendSeqElem, mArrToSeq}:
+        if magic in {mNone, mMove, mSlice,
+            mAppendStrCh, mAppendStrStr, mAppendSeqElem,
+            mArrToSeq, mOpenArrayToSeq}:
           for i in 1..<n.len:
             # we always have to assume a 'select(...)' like mechanism.
             # But at least we do filter out simple POD types from the
@@ -575,24 +628,33 @@ proc borrowingAsgn(c: var Partitions; dest, src: PNode) =
   if dest.kind == nkSym:
     if directViewType(dest.typ) != noView:
       borrowFrom(c, dest.sym, src)
-  elif dest.kind in {nkHiddenDeref, nkDerefExpr, nkBracketExpr}:
-    case directViewType(dest[0].typ)
-    of mutableView, immutableView:
-      # we do not borrow, but we use the view to mutate the borrowed
-      # location:
-      let viewOrigin = pathExpr(dest, c.owner)
-      if viewOrigin.kind == nkSym:
-        let vid = variableId(c, viewOrigin.sym)
+  else:
+    let viewOrigin = pathExpr(dest, c.owner)
+    if viewOrigin != nil and viewOrigin.kind == nkSym:
+      let viewSym = viewOrigin.sym
+      let directView = directViewType(dest[0].typ) # check something like result[first] = toOpenArray(s, first, last-1)
+                                                   # so we don't need to iterate the original type
+      let originSymbolView = directViewType(viewSym.typ) # find the original symbol which preserves the view type
+                                                    #  var foo: var Object = a
+                                                    #  foo.id = 777 # the type of foo is no view, so we need
+                                                    #  to check the original symbol
+      let viewSets = {directView, originSymbolView}
+
+      if viewSets * {mutableView, immutableView} != {}:
+        # we do not borrow, but we use the view to mutate the borrowed
+        # location:
+        let vid = variableId(c, viewSym)
         if vid >= 0:
           c.s[vid].flags.incl viewDoesMutate
-    #[of immutableView:
-      if dest.kind == nkBracketExpr and dest[0].kind == nkHiddenDeref and
-          mutableParameter(dest[0][0]):
-        discard "remains a mutable location anyhow"
+      #[of immutableView:
+        if dest.kind == nkBracketExpr and dest[0].kind == nkHiddenDeref and
+            mutableParameter(dest[0][0]):
+          discard "remains a mutable location anyhow"
+        else:
+          localError(c.g.config, dest.info, "attempt to mutate a borrowed location from an immutable view")
+          ]#
       else:
-        localError(c.g.config, dest.info, "attempt to mutate a borrowed location from an immutable view")
-        ]#
-    of noView: discard "nothing to do"
+        discard "nothing to do"
 
 proc containsPointer(t: PType): bool =
   proc wrap(t: PType): bool {.nimcall.} = t.kind in {tyRef, tyPtr}
@@ -602,7 +664,8 @@ proc deps(c: var Partitions; dest, src: PNode) =
   if borrowChecking in c.goals:
     borrowingAsgn(c, dest, src)
 
-  var targets, sources: seq[(PSym, int)]
+  var targets: seq[(PSym, int)] = @[]
+  var sources: seq[(PSym, int)] = @[]
   allRoots(dest, targets, 0)
   allRoots(src, sources, 0)
 
@@ -634,9 +697,13 @@ proc deps(c: var Partitions; dest, src: PNode) =
           else:
             let srcid = variableId(c, s)
             if srcid >= 0:
-              if s.kind notin {skResult, skParam} and (
-                  c.s[srcid].aliveEnd < c.s[vid].aliveEnd):
-                # you cannot borrow from a local that lives shorter than 'vid':
+              if s.kind notin {skResult, skParam} and
+                  c.s[srcid].aliveEnd < c.s[vid].aliveEnd and
+                  c.g.config.backend != backendJs:
+                # you cannot borrow from a local that lives shorter than 'vid'.
+                # On a traced (JS/GC) target the source object stays alive as long
+                # as the alias references it, so this lifetime rule does not apply;
+                # value-semantics safety is enforced by `dangerousMutation` instead.
                 when explainCursors: echo "B not a cursor ", d.sym, " ", c.s[srcid].aliveEnd, " ", c.s[vid].aliveEnd
                 c.s[vid].flags.incl preventCursor
               elif {isReassigned, preventCursor} * c.s[srcid].flags != {}:
@@ -647,19 +714,12 @@ proc deps(c: var Partitions; dest, src: PNode) =
                 when explainCursors: echo "D not a cursor ", d.sym, " reassignedTo ", c.s[srcid].reassignedTo
                 c.s[vid].flags.incl preventCursor
 
-const
-  nodesToIgnoreSet = {nkNone..pred(nkSym), succ(nkSym)..nkNilLit,
-    nkTypeSection, nkProcDef, nkConverterDef,
-    nkMethodDef, nkIteratorDef, nkMacroDef, nkTemplateDef, nkLambda, nkDo,
-    nkFuncDef, nkConstSection, nkConstDef, nkIncludeStmt, nkImportStmt,
-    nkExportStmt, nkPragma, nkCommentStmt, nkBreakState,
-    nkTypeOfExpr, nkMixinStmt, nkBindStmt}
 
 proc potentialMutationViaArg(c: var Partitions; n: PNode; callee: PType) =
   if constParameters in c.goals and tfNoSideEffect in callee.flags:
     discard "we know there are no hidden mutations through an immutable parameter"
   elif c.inNoSideEffectSection == 0 and containsPointer(n.typ):
-    var roots: seq[(PSym, int)]
+    var roots: seq[(PSym, int)] = @[]
     allRoots(n, roots, RootEscapes)
     for r in roots: potentialMutation(c, r[0], r[1], n.info)
 
@@ -670,6 +730,10 @@ proc traverse(c: var Partitions; n: PNode) =
     for child in n:
       let last = lastSon(child)
       traverse(c, last)
+      for i in 0..<child.len-2:
+        if child[i].kind == nkSym:
+          let vid = variableId(c, child[i].sym)
+          if vid >= 0: c.s[vid].declScope = c.scopeDepth
       if child.kind == nkVarTuple and last.kind in {nkPar, nkTupleConstr}:
         if child.len-2 != last.len: return
         for i in 0..<child.len-2:
@@ -679,7 +743,7 @@ proc traverse(c: var Partitions; n: PNode) =
         for i in 0..<child.len-2:
           #registerVariable(c, child[i])
           deps(c, child[i], last)
-  of nkAsgn, nkFastAsgn:
+  of nkAsgn, nkFastAsgn, nkSinkAsgn:
     traverse(c, n[0])
     inc c.inAsgnSource
     traverse(c, n[1])
@@ -695,15 +759,19 @@ proc traverse(c: var Partitions; n: PNode) =
     for child in n: traverse(c, child)
 
     let parameters = n[0].typ
-    let L = if parameters != nil: parameters.len else: 0
+    let L = if parameters != nil: parameters.signatureLen else: 0
     let m = getMagic(n)
+
+    if m == mEnsureMove and n[1].kind == nkSym:
+      # we know that it must be moved so it cannot be a cursor
+      noCursor(c, n[1].sym)
 
     for i in 1..<n.len:
       let it = n[i]
       if i < L:
         let paramType = parameters[i].skipTypes({tyGenericInst, tyAlias})
         if not paramType.isCompileTimeOnly and paramType.kind in {tyVar, tySink, tyOwned}:
-          var roots: seq[(PSym, int)]
+          var roots: seq[(PSym, int)] = @[]
           allRoots(it, roots, RootEscapes)
           if paramType.kind == tyVar:
             if c.inNoSideEffectSection == 0:
@@ -762,6 +830,7 @@ proc traverse(c: var Partitions; n: PNode) =
     traverse(c, n.lastSon)
     dec c.inNoSideEffectSection, enforceNoSideEffects
   of nkWhileStmt, nkForStmt, nkParForStmt:
+    inc c.scopeDepth
     for child in n: traverse(c, child)
     # analyse loops twice so that 'abstractTime' suffices to detect cases
     # like:
@@ -769,6 +838,22 @@ proc traverse(c: var Partitions; n: PNode) =
     #     mutate(graph)
     #     connect(graph, cursorVar)
     for child in n: traverse(c, child)
+
+    if n.kind == nkWhileStmt:
+      traverse(c, n[0])
+      # variables in while condition has longer alive time than local variables
+      # in the while loop body
+    dec c.scopeDepth
+  of nkDefer:
+    if c.processDefer:
+      for child in n: traverse(c, child)
+  of nkBlockStmt, nkBlockExpr, nkTryStmt, nkElifBranch, nkElifExpr, nkElse,
+      nkElseExpr, nkOfBranch, nkExceptBranch, nkFinally:
+    # these open a new scope in which temporaries are destroyed
+    # (see injectdestructors):
+    inc c.scopeDepth
+    for child in n: traverse(c, child)
+    dec c.scopeDepth
   else:
     for child in n: traverse(c, child)
 
@@ -799,7 +884,11 @@ proc computeLiveRanges(c: var Partitions; n: PNode) =
           registerVariable(c, child[i])
           #deps(c, child[i], last)
 
-  of nkAsgn, nkFastAsgn:
+        if c.inLoop > 0 and child[0].kind == nkSym: # bug #22787
+          let vid = variableId(c, child[0].sym)
+          if child[^1].kind != nkEmpty:
+            markAsReassigned(c, vid)
+  of nkAsgn, nkFastAsgn, nkSinkAsgn:
     computeLiveRanges(c, n[0])
     computeLiveRanges(c, n[1])
     if n[0].kind == nkSym:
@@ -807,6 +896,10 @@ proc computeLiveRanges(c: var Partitions; n: PNode) =
       if vid >= 0:
         if n[1].kind == nkSym and (c.s[vid].reassignedTo == 0 or c.s[vid].reassignedTo == n[1].sym.id):
           c.s[vid].reassignedTo = n[1].sym.id
+          if c.inConditional > 0 and c.inLoop > 0:
+            # bug #22200: live ranges with loops and conditionals are too
+            # complex for our current analysis, so we prevent the cursorfication.
+            c.s[vid].flags.incl isConditionallyReassigned
         else:
           markAsReassigned(c, vid)
 
@@ -826,7 +919,7 @@ proc computeLiveRanges(c: var Partitions; n: PNode) =
     for child in n: computeLiveRanges(c, child)
 
     let parameters = n[0].typ
-    let L = if parameters != nil: parameters.len else: 0
+    let L = if parameters != nil: parameters.signatureLen else: 0
 
     for i in 1..<n.len:
       let it = n[i]
@@ -855,11 +948,21 @@ proc computeLiveRanges(c: var Partitions; n: PNode) =
     #     connect(graph, cursorVar)
     inc c.inLoop
     for child in n: computeLiveRanges(c, child)
-    inc c.inLoop
+    dec c.inLoop
+
+    if n.kind == nkWhileStmt:
+      computeLiveRanges(c, n[0])
+      # variables in while condition has longer alive time than local variables
+      # in the while loop body
   of nkElifBranch, nkElifExpr, nkElse, nkOfBranch:
     inc c.inConditional
     for child in n: computeLiveRanges(c, child)
     dec c.inConditional
+  of nkDefer:
+    if c.processDefer:
+      for child in n: computeLiveRanges(c, child)
+    else:
+      c.defers.add n
   else:
     for child in n: computeLiveRanges(c, child)
 
@@ -873,9 +976,17 @@ proc computeGraphPartitions*(s: PSym; n: PNode; g: ModuleGraph; goals: set[Goal]
       registerResult(result, s.ast[resultPos])
 
   computeLiveRanges(result, n)
+  result.processDefer = true
+  for i in countdown(len(result.defers)-1, 0):
+    computeLiveRanges(result, result.defers[i])
+  result.processDefer = false
   # restart the timer for the second pass:
   result.abstractTime = AbstractTime 0
   traverse(result, n)
+  result.processDefer = true
+  for i in countdown(len(result.defers)-1, 0):
+    traverse(result, result.defers[i])
+  result.processDefer = false
 
 proc dangerousMutation(g: MutationInfo; v: VarIndex): bool =
   #echo "range ", v.aliveStart, " .. ", v.aliveEnd, " ", v.sym
@@ -929,18 +1040,29 @@ proc checkBorrowedLocations*(par: var Partitions; body: PNode; config: ConfigRef
       #if par.s[rid].con.kind == isRootOf and dangerousMutation(par.graphs[par.s[rid].con.graphIndex], par.s[i]):
       #  cannotBorrow(config, s, par.graphs[par.s[rid].con.graphIndex])
 
+proc jsDeepCopied(t: PType): bool =
+  ## On the JS backend `nimCopy` deep-copies these type classes on every
+  ## assignment, so eliding the copy for a safe alias is worthwhile even when
+  ## the type has no C-style destructor.
+  t.skipTypes({tyGenericInst, tyAlias, tyDistinct, tyVar, tyLent}).kind in
+    {tyObject, tyTuple, tyArray, tySequence, tyString}
+
 proc computeCursors*(s: PSym; n: PNode; g: ModuleGraph) =
+  let jsCursors = g.config.backend == backendJs
   var par = computeGraphPartitions(s, n, g, {cursorInference})
   for i in 0 ..< par.s.len:
     let v = addr(par.s[i])
     if v.flags * {ownsData, preventCursor, isConditionallyReassigned} == {} and
         v.sym.kind notin {skParam, skResult} and
-        v.sym.flags * {sfThread, sfGlobal} == {} and hasDestructor(v.sym.typ) and
-        v.sym.typ.skipTypes({tyGenericInst, tyAlias}).kind != tyOwned:
+        v.sym.flags * {sfThread, sfGlobal} == {} and
+        (hasDestructor(v.sym.typ) or (jsCursors and jsDeepCopied(v.sym.typ))) and
+        v.sym.typ.skipTypes({tyGenericInst, tyAlias}).kind != tyOwned and
+        not hasDisabledAsgn(g, v.sym.typ) and
+        not hasDisabledDup(g, v.sym.typ):
       let rid = root(par, i)
       if par.s[rid].con.kind == isRootOf and dangerousMutation(par.graphs[par.s[rid].con.graphIndex], par.s[i]):
         discard "cannot cursor into a graph that is mutated"
       else:
-        v.sym.flags.incl sfCursor
+        v.sym.flagsImpl.incl sfCursor
         when false:
           echo "this is now a cursor ", v.sym, " ", par.s[rid].flags, " ", g.config $ v.sym.info

@@ -1,8 +1,10 @@
 discard """
+  matrix: "--mm:refc; --mm:orc"
   targets: "c js"
 """
 
 import std/[lists, sequtils]
+import std/assertions
 
 const
   data = [1, 2, 3, 4, 5, 6]
@@ -233,6 +235,66 @@ template main =
     doAssert l.toSeq == [1]
     doAssert l.remove(l.head) == true
     doAssert l.toSeq == []
+  
+  block issue19297: # add (appends a shallow copy)
+    var a: SinglyLinkedList[int]
+    var b: SinglyLinkedList[int]
+
+    doAssert a.toSeq == @[]
+    a.add(1)
+    doAssert a.toSeq == @[1]
+    a.add(b)
+    doAssert a.toSeq == @[1]
+    a.add(2)
+    doAssert a.toSeq == @[1, 2]
+  
+  block issue19314: # add (appends a shallow copy)
+    var a: DoublyLinkedList[int]
+    var b: DoublyLinkedList[int]
+
+    doAssert a.toSeq == @[]
+    a.add(1)
+    doAssert a.toSeq == @[1]
+    a.add(b)
+    doAssert a.toSeq == @[1]
+    a.add(2)
+    doAssert a.toSeq == @[1, 2]
+
+  block RemoveLastNodeFromSinglyLinkedList:
+    var list = initSinglyLinkedList[string]()
+    let n1 = newSinglyLinkedNode("sonic")
+    let n2 = newSinglyLinkedNode("the")
+    let n3 = newSinglyLinkedNode("tiger")
+    let n4 = newSinglyLinkedNode("hedgehog")
+    list.add(n1)
+    list.add(n2)
+    list.add(n3)
+    list.remove(n3)
+    list.add(n4)
+    doAssert list.toSeq == @["sonic", "the", "hedgehog"]
+
+
+  block:
+    var list = initSinglyLinkedList[int]()
+
+    list.add(4)
+    list.remove(list.head)
+
+    list.add(5)
+    list.remove(list.head)
+
+    list.add(6)
 
 static: main()
 main()
+
+# https://github.com/nim-lang/Nim/issues/18583
+type EmptyStr18583List = object
+proc `$`(x: EmptyStr18583List): string = ""
+
+block:
+  var L: SinglyLinkedList[EmptyStr18583List]
+  L.prepend(EmptyStr18583List())
+  L.prepend(EmptyStr18583List())
+  let s = $L
+  doAssert s == "[, ]", "got: " & s

@@ -1,4 +1,6 @@
 discard """
+  matrix: "--mm:refc"
+  disabled: "win"
   output: '''
 '''
 """

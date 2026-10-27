@@ -7,7 +7,9 @@
 #    distribution, for details about the copyright.
 #
 
-from posix import SocketHandle
+from std/posix import SocketHandle
+
+var EPOLL_CLOEXEC* {.importc: "EPOLL_CLOEXEC", header: "<sys/epoll.h>".}: cint
 
 const
   EPOLLIN* = 0x00000001
@@ -33,19 +35,30 @@ const
   EPOLL_CTL_DEL* = 2          # Remove a file descriptor from the interface.
   EPOLL_CTL_MOD* = 3          # Change file descriptor epoll_event structure.
 
+# Linux amd64 uses a packed event; illumos amd64 uses #pragma pack(4).
+# Both place data at offset 4 and have a 12-byte array stride.
+# https://github.com/torvalds/linux/blob/ff6992735ade75aae3e35d16b17da1008d753d28/include/uapi/linux/eventpoll.h#L77
+when (defined(linux) or defined(illumos)) and defined(amd64):
+  {.pragma: epollPacked, packed.}
+else:
+  {.pragma: epollPacked.}
+
 type
-  EpollData* {.importc: "union epoll_data",
-      header: "<sys/epoll.h>", pure, final.} = object # TODO: This is actually a union.
+  EpollData* {.importc: "epoll_data_t",
+      header: "<sys/epoll.h>", pure, final, union, completeStruct.} = object
+    `ptr`* {.importc: "ptr".}: pointer
+    fd* {.importc: "fd".}: cint
+    u32* {.importc: "u32".}: uint32
     u64* {.importc: "u64".}: uint64
 
-  EpollEvent* {.importc: "struct epoll_event", header: "<sys/epoll.h>", pure, final.} = object
+  EpollEvent* {.importc: "struct epoll_event", header: "<sys/epoll.h>", pure, final, completeStruct, epollPacked.} = object
     events*: uint32 # Epoll events
     data*: EpollData # User data variable
 
 proc epoll_create*(size: cint): cint {.importc: "epoll_create",
     header: "<sys/epoll.h>".}
   ## Creates an epoll instance.  Returns an fd for the new instance.
-  ## 
+  ##
   ## The "size" parameter is a hint specifying the number of file
   ## descriptors to be associated with the new instance.  The fd
   ## returned by epoll_create() should be closed with close().
@@ -59,7 +72,7 @@ proc epoll_ctl*(epfd: cint; op: cint; fd: cint | SocketHandle; event: ptr EpollE
     importc: "epoll_ctl", header: "<sys/epoll.h>".}
   ## Manipulate an epoll instance "epfd". Returns `0` in case of success,
   ## `-1` in case of error (the "errno" variable will contain the specific error code).
-  ## 
+  ##
   ## The "op" parameter is one of the `EPOLL_CTL_*`
   ## constants defined above. The "fd" parameter is the target of the
   ## operation. The "event" parameter describes which events the caller

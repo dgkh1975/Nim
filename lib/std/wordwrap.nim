@@ -9,7 +9,7 @@
 
 ## This module contains an algorithm to wordwrap a Unicode string.
 
-import strutils, unicode
+import std/[strutils, unicode]
 
 proc olen(s: string; start, lastExclusive: int): int =
   var i = start
@@ -53,6 +53,8 @@ proc wrapWords*(s: string, maxLineWidth = 80,
       let wlen = olen(s, i, j)
       if wlen > spaceLeft:
         if splitLongWords and wlen > maxLineWidth:
+          if lastSep.len > 0 and spaceLeft > 0:
+            result.add(lastSep)
           var k = 0
           while k < j - i:
             if spaceLeft <= 0:

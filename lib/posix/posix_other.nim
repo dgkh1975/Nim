@@ -10,7 +10,7 @@
 when defined(nimHasStyleChecks):
   {.push styleChecks: off.}
 
-when defined(freertos):
+when defined(freertos) or defined(zephyr):
   const
     hasSpawnH = false # should exist for every Posix system nowadays
     hasAioH = false
@@ -24,13 +24,22 @@ when defined(linux) and not defined(android):
   # timer_{create,delete,settime,gettime},
   # clock_{getcpuclockid, getres, gettime, nanosleep, settime} lives in librt
   {.passl: "-lrt".}
-when defined(solaris):
+when defined(sunos):
   # On Solaris hstrerror lives in libresolv
   {.passl: "-lresolv".}
 
+when defined(linux) and defined(arm64):
+  type
+    PosixInt = cint
+    PosixUInt = cuint
+else:
+  type
+    PosixInt = int
+    PosixUInt = int
+
 type
   DIR* {.importc: "DIR", header: "<dirent.h>",
-          incompleteStruct.} = object
+          incompleteStruct, byref.} = object
     ## A type representing a directory stream.
 
 type
@@ -149,14 +158,14 @@ type
   Blksize* {.importc: "blksize_t", header: "<sys/types.h>".} = int
     ## used for block sizes
   Clock* {.importc: "clock_t", header: "<sys/types.h>".} = int
-  ClockId* {.importc: "clockid_t", header: "<sys/types.h>".} = int
+  ClockId* {.importc: "clockid_t", header: "<sys/types.h>".} = PosixInt
   Dev* {.importc: "dev_t", header: "<sys/types.h>".} = int
   Fsblkcnt* {.importc: "fsblkcnt_t", header: "<sys/types.h>".} = int
   Fsfilcnt* {.importc: "fsfilcnt_t", header: "<sys/types.h>".} = int
-  Gid* {.importc: "gid_t", header: "<sys/types.h>".} = int
-  Id* {.importc: "id_t", header: "<sys/types.h>".} = int
+  Gid* {.importc: "gid_t", header: "<sys/types.h>".} = PosixUInt
+  Id* {.importc: "id_t", header: "<sys/types.h>".} = PosixUInt
   Ino* {.importc: "ino_t", header: "<sys/types.h>".} = int
-  Key* {.importc: "key_t", header: "<sys/types.h>".} = int
+  Key* {.importc: "key_t", header: "<sys/types.h>".} = PosixInt
   Mode* {.importc: "mode_t", header: "<sys/types.h>".} = (
     when defined(android) or defined(macos) or defined(macosx) or
         (defined(bsd) and not defined(openbsd) and not defined(netbsd)):
@@ -164,28 +173,33 @@ type
     else:
       uint32
   )
-  Nlink* {.importc: "nlink_t", header: "<sys/types.h>".} = int
+  Nlink* {.importc: "nlink_t", header: "<sys/types.h>".} = PosixUInt
   Off* {.importc: "off_t", header: "<sys/types.h>".} = int64
   Pid* {.importc: "pid_t", header: "<sys/types.h>".} = int32
-  Pthread_attr* {.importc: "pthread_attr_t", header: "<sys/types.h>".} = int
+  # The headers supply the native pthread layouts, so these opaque objects
+  # cannot promise a completeStruct layout.
+  Pthread_attr* {.importc: "pthread_attr_t",
+    header: "<pthread.h>", pure, final.} = object
   Pthread_barrier* {.importc: "pthread_barrier_t",
-                      header: "<sys/types.h>".} = int
+    header: "<pthread.h>", pure, final.} = object
   Pthread_barrierattr* {.importc: "pthread_barrierattr_t",
-                          header: "<sys/types.h>".} = int
-  Pthread_cond* {.importc: "pthread_cond_t", header: "<sys/types.h>".} = int
+    header: "<pthread.h>", pure, final.} = object
+  Pthread_cond* {.importc: "pthread_cond_t",
+    header: "<pthread.h>", pure, final.} = object
   Pthread_condattr* {.importc: "pthread_condattr_t",
-                       header: "<sys/types.h>".} = int
-  Pthread_key* {.importc: "pthread_key_t", header: "<sys/types.h>".} = int
-  Pthread_mutex* {.importc: "pthread_mutex_t", header: "<sys/types.h>".} = int
+    header: "<pthread.h>", pure, final.} = object
+  Pthread_key* {.importc: "pthread_key_t", header: "<sys/types.h>".} = PosixUInt
+  Pthread_mutex* {.importc: "pthread_mutex_t",
+    header: "<pthread.h>", pure, final.} = object
   Pthread_mutexattr* {.importc: "pthread_mutexattr_t",
-                        header: "<sys/types.h>".} = int
-  Pthread_once* {.importc: "pthread_once_t", header: "<sys/types.h>".} = int
+    header: "<pthread.h>", pure, final.} = object
+  Pthread_once* {.importc: "pthread_once_t", header: "<sys/types.h>".} = PosixInt
   Pthread_rwlock* {.importc: "pthread_rwlock_t",
-                     header: "<sys/types.h>".} = int
+    header: "<pthread.h>", pure, final.} = object
   Pthread_rwlockattr* {.importc: "pthread_rwlockattr_t",
-                         header: "<sys/types.h>".} = int
+    header: "<pthread.h>", pure, final.} = object
   Pthread_spinlock* {.importc: "pthread_spinlock_t",
-                       header: "<sys/types.h>".} = int
+                       header: "<sys/types.h>".} = PosixInt
   Pthread* {.importc: "pthread_t", header: "<sys/types.h>".} = int
   Suseconds* {.importc: "suseconds_t", header: "<sys/types.h>".} = int
   #Ttime* {.importc: "time_t", header: "<sys/types.h>".} = int
@@ -196,8 +210,8 @@ type
   Trace_event_set* {.importc: "trace_event_set_t",
                       header: "<sys/types.h>".} = int
   Trace_id* {.importc: "trace_id_t", header: "<sys/types.h>".} = int
-  Uid* {.importc: "uid_t", header: "<sys/types.h>".} = int
-  Useconds* {.importc: "useconds_t", header: "<sys/types.h>".} = int
+  Uid* {.importc: "uid_t", header: "<sys/types.h>".} = PosixUInt
+  Useconds* {.importc: "useconds_t", header: "<sys/types.h>".} = PosixUInt
 
   Utsname* {.importc: "struct utsname",
               header: "<sys/utsname.h>",
@@ -391,10 +405,34 @@ when hasSpawnH:
                                  header: "<spawn.h>", final, pure.} = object
 
 when defined(linux):
+  const Sockaddr_max_length* = 255
   # from sys/un.h
   const Sockaddr_un_path_length* = 108
+elif defined(zephyr):
+  when defined(net_ipv6):
+    const Sockaddr_max_length* = 24
+  elif defined(net_raw):
+    const Sockaddr_max_length* = 20
+  elif defined(net_ipv4):
+    const Sockaddr_max_length* = 8
+  else:
+    const Sockaddr_max_length* = 255 # just for compilation purposes
+
+  const Sockaddr_un_path_length* = Sockaddr_max_length
+  # Zephyr is heavily customizable so it's easy to get to a state  
+  # where Nim & Zephyr IPv6 settings are out of sync, causing painful runtime failures. 
+  when defined(net_ipv4) or defined(net_ipv6) or defined(net_raw):
+    {.emit: ["NIM_STATIC_ASSERT(NET_SOCKADDR_MAX_SIZE == ",
+        Sockaddr_max_length,
+        ",\"NET_SOCKADDR_MAX_SIZE and Sockaddr_max_length size mismatch!",
+        " Check that Nim and Zephyr IPv4/IPv6 settings match.",
+        " Try adding -d:net_ipv6 to enable IPv6 for Nim on Zephyr.\" );"].}
+elif defined(freertos) or defined(lwip):
+  const Sockaddr_max_length* = 14
+  const Sockaddr_un_path_length* = 108
 else:
-  # according to http://pubs.opengroup.org/onlinepubs/009604499/basedefs/sys/un.h.html
+  const Sockaddr_max_length* = 255
+  # according to https://pubs.opengroup.org/onlinepubs/009604499/basedefs/sys/un.h.html
   # this is >=92
   const Sockaddr_un_path_length* = 92
 
@@ -408,47 +446,49 @@ when defined(lwip):
                 pure, final.} = object ## struct sockaddr
       sa_len*: uint8         ## Address family.
       sa_family*: TSa_Family         ## Address family.
-      sa_data*: array[0..255, char] ## Socket address (variable-length data).
+      sa_data*: array[0..Sockaddr_max_length-sizeof(uint8)-sizeof(TSa_Family), char] ## Socket address (variable-length data).
+
+    Sockaddr_storage* {.importc: "struct sockaddr_storage",
+                        header: "<sys/socket.h>",
+                        pure, final.} = object ## struct sockaddr_storage
+      s2_len*: uint8 ## Address family.
+      ss_family*: TSa_Family ## Address family.
+      s2_data1*: array[2, char] ## Address family.
+      s2_data2*: array[3, uint32] ## Address family.
+      when defined(lwip6) or defined(net_ipv6):
+        s2_data3*: array[3, uint32] ## Address family.
+elif defined(zephyr):
+  type
+    SockAddr* {.importc: "struct sockaddr", header: "<sys/socket.h>",
+                pure, final.} = object ## struct sockaddr
+      sa_family*: TSa_Family         ## Address family.
+      data*: array[0..Sockaddr_max_length-sizeof(TSa_Family), char] ## Socket address (variable-length data).
+
+    Sockaddr_storage* {.importc: "struct sockaddr_storage",
+                        header: "<sys/socket.h>",
+                        pure, final.} = object ## struct sockaddr_storage
+      ss_family*: TSa_Family ## Address family.
+      data*: array[0..Sockaddr_max_length-sizeof(TSa_Family), char] ## Socket address (variable-length data).
+  {.emit: ["NIM_STATIC_ASSERT(sizeof(struct sockaddr) == ", sizeof(Sockaddr), ",\"struct size mismatch\" );"].}
+  {.emit: ["NIM_STATIC_ASSERT(sizeof(struct sockaddr_storage) == ", sizeof(Sockaddr_storage), ",\"struct size mismatch\" );"].}
 else:
   type
     SockAddr* {.importc: "struct sockaddr", header: "<sys/socket.h>",
                 pure, final.} = object ## struct sockaddr
       sa_family*: TSa_Family         ## Address family.
-      sa_data*: array[0..255, char] ## Socket address (variable-length data).
+      sa_data*: array[0..Sockaddr_max_length-sizeof(TSa_Family), char] ## Socket address (variable-length data).
+
+    Sockaddr_storage* {.importc: "struct sockaddr_storage",
+                        header: "<sys/socket.h>",
+                        pure, final.} = object ## struct sockaddr_storage
+      ss_family*: TSa_Family ## Address family.
 
 type
   Sockaddr_un* {.importc: "struct sockaddr_un", header: "<sys/un.h>",
               pure, final.} = object ## struct sockaddr_un
     sun_family*: TSa_Family         ## Address family.
-    sun_path*: array[0..Sockaddr_un_path_length-1, char] ## Socket path
+    sun_path*: array[0..Sockaddr_un_path_length-sizeof(TSa_Family), char] ## Socket path
 
-
-when defined(lwip):
-  when not defined(lwip6):
-    type
-      Sockaddr_storage* {.importc: "struct sockaddr_storage",
-                          header: "<sys/socket.h>",
-                          pure, final.} = object ## struct sockaddr_storage
-        s2_len*: uint8 ## Address family.
-        ss_family*: TSa_Family ## Address family.
-        s2_data1*: array[2, char] ## Address family.
-        s2_data2*: array[3, uint32] ## Address family.
-  else:
-    type
-      Sockaddr_storage* {.importc: "struct sockaddr_storage",
-                          header: "<sys/socket.h>",
-                          pure, final.} = object ## struct sockaddr_storage
-        s2_len*: uint8 ## Address family.
-        ss_family*: TSa_Family ## Address family.
-        s2_data1*: array[2, char] ## Address family.
-        s2_data2*: array[3, uint32] ## Address family.
-        s2_data3*: array[3, uint32] ## Address family.
-else:
-  type
-    Sockaddr_storage* {.importc: "struct sockaddr_storage",
-                        header: "<sys/socket.h>",
-                        pure, final.} = object ## struct sockaddr_storage
-      ss_family*: TSa_Family ## Address family.
 
 type
   Tif_nameindex* {.importc: "struct if_nameindex", final,
@@ -494,6 +534,7 @@ type
              header: "<netinet/in.h>".} = object ## struct in_addr
     s_addr*: InAddrScalar
 
+  # TODO: Fixme for FreeRTOS/LwIP, these are incorrect
   Sockaddr_in* {.importc: "struct sockaddr_in", pure, final,
                   header: "<netinet/in.h>".} = object ## struct sockaddr_in
     sin_family*: TSa_Family ## AF_INET.
@@ -577,8 +618,6 @@ when not defined(lwip):
       events*: cshort  ## The input event flags (see below).
       revents*: cshort ## The output event flags (see below).
 
-    Tnfds* {.importc: "nfds_t", header: "<poll.h>".} = cint
-
 var
   errno* {.importc, header: "<errno.h>".}: cint ## error variable
   h_errno* {.importc, header: "<netdb.h>".}: cint
@@ -608,10 +647,13 @@ when defined(linux) or defined(nimdoc):
       ## or UDP packets. (Requires Linux kernel > 3.9)
   else:
     const SO_REUSEPORT* = cint(15)
+elif defined(nuttx) or defined(sunos):
+  # Not supported, use SO_REUSEADDR to avoid compilation errors.
+  var SO_REUSEPORT* {.importc: "SO_REUSEADDR", header: "<sys/socket.h>".}: cint
 else:
   var SO_REUSEPORT* {.importc, header: "<sys/socket.h>".}: cint
 
-when defined(linux) or defined(bsd):
+when defined(linux) or defined(bsd) or defined(nuttx):
   var SOCK_CLOEXEC* {.importc, header: "<sys/socket.h>".}: cint
 
 when defined(macosx):
@@ -621,11 +663,11 @@ when defined(macosx):
     MSG_NOSIGNAL* = 0'i32
   var
     SO_NOSIGPIPE* {.importc, header: "<sys/socket.h>".}: cint
-elif defined(solaris):
+elif defined(sunos):
   # Solaris doesn't have MSG_NOSIGNAL
   const
     MSG_NOSIGNAL* = 0'i32
-elif defined(freertos) or defined(lwip):
+elif defined(zephyr) or defined(freertos) or defined(lwip):
   # LwIP/FreeRTOS doesn't have MSG_NOSIGNAL
   const
     MSG_NOSIGNAL* = 0x20'i32
@@ -640,14 +682,14 @@ when defined(haiku):
 
 when hasSpawnH:
   when defined(linux):
-    # better be safe than sorry; Linux has this flag, macosx doesn't, don't
-    # know about the other OSes
+    # better be safe than sorry; Linux has this flag, macosx and NuttX don't,
+    # don't know about the other OSes
 
-    # Non-GNU systems like TCC and musl-libc  don't define __USE_GNU, so we
+    # Non-GNU systems like TCC and musl-libc don't define __USE_GNU, so we
     # can't get the magic number from spawn.h
     const POSIX_SPAWN_USEVFORK* = cint(0x40)
   else:
-    # macosx lacks this, so we define the constant to be 0 to not affect
+    # macosx and NuttX lack this, so we define the constant to be 0 to not affect
     # OR'ing of flags:
     const POSIX_SPAWN_USEVFORK* = cint(0)
 

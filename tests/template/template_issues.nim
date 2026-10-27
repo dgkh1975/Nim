@@ -13,6 +13,7 @@ foo
 foo
 false
 true
+0
 '''
 """
 
@@ -173,7 +174,7 @@ block t2585:
       st
       echo "a ", $fb
 
-  proc render(rdat: var RenderData; passes: var openarray[RenderPass]; proj: Mat2;
+  proc render(rdat: var RenderData; passes: var openArray[RenderPass]; proj: Mat2;
               indexType = 1) =
       for i in 0 ..< len(passes):
           echo "blah ", repr(passes[i])
@@ -296,3 +297,16 @@ block: # bug #12595
     discard {i: ""}
 
   test()
+
+block: # bug #21920
+  template t[T](): T =
+    discard
+
+  t[void]() # Error: expression has no type: discard
+
+template m(a: uint, p: int) = discard
+
+block: # bug #23680
+  template m(x: untyped, i: int) = echo x
+  proc j(n: int | int) = m([0][0], 0)
+  j(0)

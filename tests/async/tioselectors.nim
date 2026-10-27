@@ -58,7 +58,11 @@ when not defined(windows):
     registerHandle(selector, client_socket, {Event.Write}, 0)
 
     freeAddrInfo(aiList)
-    discard selector.select(100)
+
+    # make sure both sockets are selected
+    var nevs = 0
+    while nevs < 2:
+      nevs += selector.select(100).len
 
     var sockAddress: SockAddr
     var addrLen = sizeof(sockAddress).Socklen
@@ -234,7 +238,7 @@ when not defined(windows):
       if fd == -1:
         raiseOsError(osLastError())
       let length = len(data).cint
-      if posix.write(fd, cast[pointer](unsafeAddr data[0]),
+      if posix.write(fd, cast[pointer](addr data[0]),
                      len(data).cint) != length:
         raiseOsError(osLastError())
       if posix.close(fd) == -1:
@@ -288,8 +292,8 @@ when not defined(windows):
         events: set[Event]
 
     proc vnode_test(): bool =
-      proc validate(test: openarray[ReadyKey],
-                    check: openarray[valType]): bool =
+      proc validate(test: openArray[ReadyKey],
+                    check: openArray[valType]): bool =
         result = false
         if len(test) == len(check):
           for checkItem in check:
@@ -427,6 +431,20 @@ when not defined(windows):
       doAssert(res[0].fd == dirfd and
                {Event.Vnode, Event.VnodeDelete} <= res[0].events)
 
+  proc pipe_test(): bool =
+    # closing the read end of a pipe will result in it automatically
+    # being removed from the kqueue; make sure no exception is raised
+    var s = newSelector[int]()
+    var fds: array[2, cint]
+    discard pipe(fds)
+    s.registerHandle(fds[1], {Write}, 0)
+    discard close(fds[0])
+    let res = s.select(-1)
+    doAssert(res.len == 1)
+    s.unregister(fds[1])
+    discard close(fds[1])
+    return true
+
   when hasThreadSupport:
 
     var counter = 0
@@ -468,6 +486,7 @@ when not defined(windows):
   when defined(macosx) or defined(freebsd) or defined(openbsd) or
        defined(netbsd):
     processTest("File notification test...", vnode_test())
+    processTest("Pipe test...", pipe_test())
   echo("All tests passed!")
 else:
   import nativesockets, winlean, os, osproc

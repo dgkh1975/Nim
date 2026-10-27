@@ -19,24 +19,39 @@
 ## and user events.
 ##
 ## Fully supported OS: MacOSX, FreeBSD, OpenBSD, NetBSD, Linux (except
-## for Android).
+## for Android), illumos.
 ##
 ## Partially supported OS: Windows (only sockets and user events),
 ## Solaris (files, sockets, handles and user events).
 ## Android (files, sockets, handles and user events).
 ##
+## By default, the implementation is chosen based on the target
+## platform; you can pass `-d:nimIoselector=value` to override it.
+## Accepted values are "epoll", "kqueue", "poll", and "select".
+## illumos defaults to native epoll emulation; Solaris defaults to poll.
+## The poll and select backends do not support timer, signal, or process
+## notifications, regardless of the target platform.
+##
 ## TODO: `/dev/poll`, `event ports` and filesystem events.
 
-import os, nativesockets
+import std/nativesockets
+import std/oserrors
+
+when defined(nimPreviewSlimSystem):
+  import std/assertions
 
 const hasThreadSupport = compileOption("threads") and defined(threadsafe)
+const nimIoselector {.strdefine.} = ""
 
-const ioselSupportedPlatform* = defined(macosx) or defined(freebsd) or
-                                defined(netbsd) or defined(openbsd) or
-                                defined(dragonfly) or
-                                (defined(linux) and not defined(android) and not defined(emscripten))
-  ## This constant is used to determine whether the destination platform is
-  ## fully supported by `ioselectors` module.
+const ioselSupportedPlatform* =
+  nimIoselector in ["", "epoll", "kqueue"] and
+  (defined(macosx) or defined(freebsd) or defined(netbsd) or
+   defined(openbsd) or defined(dragonfly) or defined(nuttx) or
+   defined(illumos) or
+   (defined(linux) and not defined(android) and not defined(emscripten)))
+  ## Whether the destination platform and selected backend provide full
+  ## selector support. Explicit poll or select overrides disable timer,
+  ## signal, and process notifications even on otherwise supported platforms.
 
 const bsdPlatform = defined(macosx) or defined(freebsd) or
                     defined(netbsd) or defined(openbsd) or
@@ -201,12 +216,11 @@ when defined(nimdoc):
     ## to `value`. This `value` can be modified in the scope of
     ## the `withData` call.
     ##
-    ## .. code-block:: nim
-    ##
+    ##   ```nim
     ##   s.withData(fd, value) do:
     ##     # block is executed only if `fd` registered in selector `s`
     ##     value.uid = 1000
-    ##
+    ##   ```
 
   template withData*[T](s: Selector[T], fd: SocketHandle|int, value,
                         body1, body2: untyped) =
@@ -214,15 +228,14 @@ when defined(nimdoc):
     ## to `value`. This `value` can be modified in the scope of
     ## the `withData` call.
     ##
-    ## .. code-block:: nim
-    ##
+    ##   ```nim
     ##   s.withData(fd, value) do:
     ##     # block is executed only if `fd` registered in selector `s`.
     ##     value.uid = 1000
     ##   do:
     ##     # block is executed if `fd` not registered in selector `s`.
     ##     raise
-    ##
+    ##   ```
 
   proc contains*[T](s: Selector[T], fd: SocketHandle|int): bool {.inline.} =
     ## Determines whether selector contains a file descriptor.
@@ -233,9 +246,9 @@ when defined(nimdoc):
     ## For *poll* and *select* selectors `-1` is returned.
 
 else:
-  import strutils
+  import std/strutils
   when hasThreadSupport:
-    import locks
+    import std/locks
 
     type
       SharedArray[T] = UncheckedArray[T]
@@ -243,8 +256,8 @@ else:
     proc allocSharedArray[T](nsize: int): ptr SharedArray[T] =
       result = cast[ptr SharedArray[T]](allocShared0(sizeof(T) * nsize))
 
-    proc reallocSharedArray[T](sa: ptr SharedArray[T], nsize: int): ptr SharedArray[T] =
-      result = cast[ptr SharedArray[T]](reallocShared(sa, sizeof(T) * nsize))
+    proc reallocSharedArray[T](sa: ptr SharedArray[T], oldsize, nsize: int): ptr SharedArray[T] =
+      result = cast[ptr SharedArray[T]](reallocShared0(sa, oldsize * sizeof(T), sizeof(T) * nsize))
 
     proc deallocSharedArray[T](sa: ptr SharedArray[T]) =
       deallocShared(cast[pointer](sa))
@@ -286,7 +299,7 @@ else:
     setBlocking(fd.SocketHandle, false)
 
   when not defined(windows):
-    import posix
+    import std/posix
 
     template setKey(s, pident, pevents, pparam, pdata: untyped) =
       var skey = addr(s.fds[pident])
@@ -323,19 +336,53 @@ else:
     # Anything higher is the time to wait in milliseconds.
     doAssert(timeout >= -1, "Cannot select with a negative value, got: " & $timeout)
 
-  when defined(linux) and not defined(emscripten):
+  when defined(linux) or defined(windows) or defined(macosx) or defined(bsd) or
+       defined(sunos) or defined(zephyr) or defined(freertos) or defined(nuttx) or defined(haiku):
+    template maxDescriptors*(): int =
+      ## Returns the maximum number of active file descriptors for the current
+      ## process. This involves a system call. For now `maxDescriptors` is
+      ## supported on the following OSes: Windows, Linux, OSX, BSD, Solaris, illumos.
+      when defined(windows):
+        16_700_000
+      elif defined(zephyr) or defined(freertos):
+        FD_MAX
+      else:
+        var fdLim: RLimit = default(RLimit)
+        var res = int(getrlimit(RLIMIT_NOFILE, fdLim))
+        if res >= 0:
+          res = int(fdLim.rlim_cur) - 1
+        res
+
+  when nimIoselector != "":
+    when nimIoselector == "epoll":
+      include ioselects/ioselectors_epoll
+    elif nimIoselector == "kqueue":
+      include ioselects/ioselectors_kqueue
+    elif nimIoselector == "poll":
+      include ioselects/ioselectors_poll
+    elif nimIoselector == "select":
+      include ioselects/ioselectors_select
+    else:
+      {.fatal: "Unknown nimIoselector specified by define.".}
+  elif defined(linux) and not defined(emscripten):
     include ioselects/ioselectors_epoll
   elif bsdPlatform:
     include ioselects/ioselectors_kqueue
   elif defined(windows):
     include ioselects/ioselectors_select
+  elif defined(illumos):
+    include ioselects/ioselectors_epoll
   elif defined(solaris):
-    include ioselects/ioselectors_poll # need to replace it with event ports
+    include ioselects/ioselectors_poll # TODO: use event ports
   elif defined(genode):
     include ioselects/ioselectors_select # TODO: use the native VFS layer
   elif defined(nintendoswitch):
     include ioselects/ioselectors_select
   elif defined(freertos) or defined(lwip):
     include ioselects/ioselectors_select
+  elif defined(zephyr):
+    include ioselects/ioselectors_poll
+  elif defined(nuttx):
+    include ioselects/ioselectors_epoll
   else:
     include ioselects/ioselectors_poll

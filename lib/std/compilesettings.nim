@@ -13,6 +13,9 @@
 # Note: Only add new enum values at the end to ensure binary compatibility with
 # other Nim compiler versions!
 
+when defined(nimPreviewSlimSystem):
+  import std/assertions
+
 type
   SingleValueSetting* {.pure.} = enum ## \
                       ## settings resulting in a single string value
@@ -32,7 +35,8 @@ type
     backend           ## the backend (eg: c|cpp|objc|js); both `nim doc --backend:js`
                       ## and `nim js` would imply backend=js
     libPath           ## the absolute path to the stdlib library, i.e. nim's `--lib`, since 1.5.1
-    gc                ## gc selected
+    gc {.deprecated.} ## gc selected
+    mm                ## memory management selected
 
   MultipleValueSetting* {.pure.} = enum ## \
                       ## settings resulting in a seq of string values
@@ -53,6 +57,7 @@ proc querySetting*(setting: SingleValueSetting): string {.
   ##
   runnableExamples:
     const nimcache = querySetting(SingleValueSetting.nimcacheDir)
+  raiseAssert "implemented in the vmops"
 
 proc querySettingSeq*(setting: MultipleValueSetting): seq[string] {.
   compileTime, noSideEffect.} =
@@ -63,3 +68,4 @@ proc querySettingSeq*(setting: MultipleValueSetting): seq[string] {.
   ## * `compileOption <system.html#compileOption,string,string>`_ for enum options
   runnableExamples:
     const nimblePaths = querySettingSeq(MultipleValueSetting.nimblePaths)
+  raiseAssert "implemented in the vmops"

@@ -26,7 +26,7 @@
 ## Each builds on top of the layers below it. The selectors module is an
 ## abstraction for the various system `select()` mechanisms such as epoll or
 ## kqueue. If you wish you can use it directly, and some people have done so
-## `successfully <http://goran.krampe.se/2014/10/25/nim-socketserver/>`_.
+## `successfully <https://goran.krampe.se/2014/10/25/nim-socketserver/>`_.
 ## But you must be aware that on Windows it only supports
 ## `select()`.
 ##
@@ -65,8 +65,7 @@
 ##
 ## The following example demonstrates a simple chat server.
 ##
-## .. code-block:: Nim
-##
+##   ```Nim
 ##   import std/[asyncnet, asyncdispatch]
 ##
 ##   var clients {.threadvar.}: seq[AsyncSocket]
@@ -93,19 +92,25 @@
 ##
 ##   asyncCheck serve()
 ##   runForever()
-##
+##   ```
 
 import std/private/since
-import asyncdispatch, nativesockets, net, os
+
+when defined(nimPreviewSlimSystem):
+  import std/[assertions, syncio]
+
+import std/[asyncdispatch, nativesockets, net, os]
 
 export SOBool
 
 # TODO: Remove duplication introduced by PR #4683.
 
 const defineSsl = defined(ssl) or defined(nimdoc)
+const useNimNetLite = defined(nimNetLite) or defined(freertos) or defined(zephyr) or
+    defined(nuttx)
 
 when defineSsl:
-  import openssl
+  import std/openssl
 
 type
   # TODO: I would prefer to just do:
@@ -124,6 +129,8 @@ type
       bioIn: BIO
       bioOut: BIO
       sslNoShutdown: bool
+      sslVerifyHost: string ## host name to check the peer certificate
+                            ## against once the handshake is done
     domain: Domain
     sockType: SockType
     protocol: Protocol
@@ -178,11 +185,12 @@ proc getLocalAddr*(socket: AsyncSocket): (string, Port) =
   ## This is high-level interface for `getsockname`:idx:.
   getLocalAddr(socket.fd, socket.domain)
 
-proc getPeerAddr*(socket: AsyncSocket): (string, Port) =
-  ## Get the socket's peer address and port number.
-  ##
-  ## This is high-level interface for `getpeername`:idx:.
-  getPeerAddr(socket.fd, socket.domain)
+when not useNimNetLite:
+  proc getPeerAddr*(socket: AsyncSocket): (string, Port) =
+    ## Get the socket's peer address and port number.
+    ##
+    ## This is high-level interface for `getpeername`:idx:.
+    getPeerAddr(socket.fd, socket.domain)
 
 proc newAsyncSocket*(domain, sockType, protocol: cint,
                      buffered = true,
@@ -201,6 +209,33 @@ proc newAsyncSocket*(domain, sockType, protocol: cint,
                           Protocol(protocol), buffered, inheritable)
 
 when defineSsl:
+  proc raiseSslHandleError =
+    raiseSSLError("The SSL Handle is closed/unset")
+
+  proc checkCertName(socket: AsyncSocket, hostname: string) =
+    ## Raises `SslError` unless the peer certificate matches `hostname`.
+    ## Does nothing when the context does not verify the peer.
+    when not defined(nimDisableCertificateValidation):
+      if SSL_get_verify_mode(socket.sslHandle) == SSL_VERIFY_NONE:
+        return
+      try:
+        let certificate = SSL_get_peer_certificate(socket.sslHandle)
+        if certificate.isNil:
+          raiseSSLError("No SSL certificate found.")
+        const X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT = 0x1.cuint
+        let match =
+          if isIpAddress(hostname):
+            # an IP address must be listed as an IP SAN
+            certificate.X509_check_ip_asc(hostname.cstring, 0)
+          else:
+            certificate.X509_check_host(hostname.cstring, hostname.len.cint,
+              X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT, nil)
+        X509_free(certificate)
+        if match != 1:
+          raiseSSLError("SSL Certificate check failed.")
+      except LibraryError:
+        raiseSSLError("SSL import failed")
+
   proc getSslError(socket: AsyncSocket, err: cint): cint =
     assert socket.isSsl
     assert err < 0
@@ -221,10 +256,12 @@ when defineSsl:
 
   proc sendPendingSslData(socket: AsyncSocket,
       flags: set[SocketFlag]) {.async.} =
+    if socket.sslHandle == nil:
+      raiseSslHandleError()
     let len = bioCtrlPending(socket.bioOut)
     if len > 0:
       var data = newString(len)
-      let read = bioRead(socket.bioOut, addr data[0], len)
+      let read = bioRead(socket.bioOut, cast[cstring](addr data[0]), len)
       assert read != 0
       if read < 0:
         raiseSSLError()
@@ -240,9 +277,11 @@ when defineSsl:
       await sendPendingSslData(socket, flags)
     of SSL_ERROR_WANT_READ:
       var data = await recv(socket.fd.AsyncFD, BufferSize, flags)
+      if socket.sslHandle == nil:
+        raiseSslHandleError()
       let length = len(data)
       if length > 0:
-        let ret = bioWrite(socket.bioIn, addr data[0], length.cint)
+        let ret = bioWrite(socket.bioIn, cast[cstring](addr data[0]), length.cint)
         if ret < 0:
           raiseSSLError()
       elif length == 0:
@@ -252,21 +291,26 @@ when defineSsl:
     else:
       raiseSSLError("Cannot appease SSL.")
 
-  template sslLoop(socket: AsyncSocket, flags: set[SocketFlag],
-                   op: untyped) =
+  template sslLoopImpl(socket: AsyncSocket, flags: set[SocketFlag],
+                       op: untyped) =
     var opResult {.inject.} = -1.cint
     while opResult < 0:
+      if socket.sslHandle == nil:
+        raiseSslHandleError()
       ErrClearError()
       # Call the desired operation.
       opResult = op
-
+      let err =
+        if opResult < 0:
+          getSslError(socket, opResult.cint)
+        else:
+          SSL_ERROR_NONE
       # Send any remaining pending SSL data.
       await sendPendingSslData(socket, flags)
 
       # If the operation failed, try to see if SSL has some data to read
       # or write.
       if opResult < 0:
-        let err = getSslError(socket, opResult.cint)
         let fut = appeaseSsl(socket, flags, err.cint)
         yield fut
         if not fut.read():
@@ -276,6 +320,24 @@ when defineSsl:
             break
           else:
             raiseSSLError("Socket has been disconnected")
+
+  proc finishHandshake(socket: AsyncSocket, flags: set[SocketFlag]) {.async.} =
+    ## Completes the handshake and checks the peer certificate against
+    ## `socket.sslVerifyHost`, so that no application data is sent to or
+    ## read from a peer that fails the check.
+    sslLoopImpl(socket, flags, sslDoHandshake(socket.sslHandle))
+    if opResult != 1:
+      if ERR_peek_last_error() != 0: raiseSSLError()
+      else: raiseSSLError("TLS handshake failed, connection closed by peer.")
+    if socket.sslVerifyHost.len > 0:
+      checkCertName(socket, socket.sslVerifyHost)
+      socket.sslVerifyHost = ""
+
+  template sslLoop(socket: AsyncSocket, flags: set[SocketFlag],
+                   op: untyped) =
+    if socket.sslVerifyHost.len > 0:
+      await finishHandshake(socket, flags)
+    sslLoopImpl(socket, flags, op)
 
 proc dial*(address: string, port: Port, protocol = IPPROTO_TCP,
            buffered = true): owned(Future[AsyncSocket]) {.async.} =
@@ -297,14 +359,17 @@ proc connect*(socket: AsyncSocket, address: string, port: Port) {.async.} =
   await connect(socket.fd.AsyncFD, address, port, socket.domain)
   if socket.isSsl:
     when defineSsl:
+      if socket.sslHandle == nil:
+        raiseSslHandleError()
       if not isIpAddress(address):
         # Set the SNI address for this connection. This call can fail if
         # we're not using TLSv1+.
+        # RFC 6066 does not allow IP addresses as SNI host names.
         discard SSL_set_tlsext_host_name(socket.sslHandle, address)
+      socket.sslVerifyHost = address
 
-      let flags = {SocketFlag.SafeDisconn}
       sslSetConnectState(socket.sslHandle)
-      sslLoop(socket, flags, sslDoHandshake(socket.sslHandle))
+      await finishHandshake(socket, {SocketFlag.SafeDisconn})
 
 template readInto(buf: pointer, size: int, socket: AsyncSocket,
                   flags: set[SocketFlag]): int =
@@ -397,7 +462,8 @@ proc recv*(socket: AsyncSocket, size: int,
   ## to be read then the future will complete with a value of `""`.
   if socket.isBuffered:
     result = newString(size)
-    shallow(result)
+    when not defined(nimSeqsV2):
+      shallow(result)
     let originalBufPos = socket.currPos
 
     if socket.bufLen == 0:
@@ -453,7 +519,7 @@ proc send*(socket: AsyncSocket, data: string,
     when defineSsl:
       var copy = data
       sslLoop(socket, flags,
-        sslWrite(socket.sslHandle, addr copy[0], copy.len.cint))
+        sslWrite(socket.sslHandle, cast[cstring](addr copy[0]), copy.len.cint))
       await sendPendingSslData(socket, flags)
   else:
     await send(socket.fd.AsyncFD, data, flags)
@@ -646,16 +712,16 @@ proc bindAddr*(socket: AsyncSocket, port = Port(0), address = "") {.
 
   var aiList = getAddrInfo(realaddr, port, socket.domain)
   if bindAddr(socket.fd, aiList.ai_addr, aiList.ai_addrlen.SockLen) < 0'i32:
-    freeaddrinfo(aiList)
+    freeAddrInfo(aiList)
     raiseOSError(osLastError())
-  freeaddrinfo(aiList)
+  freeAddrInfo(aiList)
 
 proc hasDataBuffered*(s: AsyncSocket): bool {.since: (1, 5).} =
   ## Determines whether an AsyncSocket has data buffered.
   # xxx dedup with std/net
   s.isBuffered and s.bufLen > 0 and s.currPos != s.bufLen
 
-when defined(posix):
+when defined(posix) and not useNimNetLite:
 
   proc connectUnix*(socket: AsyncSocket, path: string): owned(Future[void]) =
     ## Binds Unix socket to `path`.
@@ -672,12 +738,12 @@ when defined(posix):
         elif ret == EINTR:
           return false
         else:
-          retFuture.fail(newException(OSError, osErrorMsg(OSErrorCode(ret))))
+          retFuture.fail(newOSError(OSErrorCode(ret)))
           return true
 
       var socketAddr = makeUnixAddr(path)
       let ret = socket.fd.connect(cast[ptr SockAddr](addr socketAddr),
-                        (sizeof(socketAddr.sun_family) + path.len).SockLen)
+                        (offsetOf(socketAddr, sun_path) + path.len + 1).SockLen)
       if ret == 0:
         # Request to connect completed immediately.
         retFuture.complete()
@@ -686,7 +752,7 @@ when defined(posix):
         if lastError.int32 == EINTR or lastError.int32 == EINPROGRESS:
           addWrite(AsyncFD(socket.fd), cb)
         else:
-          retFuture.fail(newException(OSError, osErrorMsg(lastError)))
+          retFuture.fail(newOSError(lastError))
 
   proc bindUnix*(socket: AsyncSocket, path: string) {.
     tags: [ReadIOEffect].} =
@@ -695,7 +761,7 @@ when defined(posix):
     when not defined(nimdoc):
       var socketAddr = makeUnixAddr(path)
       if socket.fd.bindAddr(cast[ptr SockAddr](addr socketAddr),
-          (sizeof(socketAddr.sun_family) + path.len).SockLen) != 0'i32:
+          (offsetOf(socketAddr, sun_path) + path.len + 1).SockLen) != 0'i32:
         raiseOSError(osLastError())
 
 elif defined(nimdoc):
@@ -717,6 +783,8 @@ proc close*(socket: AsyncSocket) =
   defer:
     socket.fd.AsyncFD.closeSocket()
     socket.closed = true # TODO: Add extra debugging checks for this.
+    when defineSsl:
+      socket.sslHandle = nil
 
   when defineSsl:
     if socket.isSsl:
@@ -776,10 +844,13 @@ when defineSsl:
 
     case handshake
     of handshakeAsClient:
-      if hostname.len > 0 and not isIpAddress(hostname):
-        # Set the SNI address for this connection. This call can fail if
-        # we're not using TLSv1+.
-        discard SSL_set_tlsext_host_name(socket.sslHandle, hostname)
+      if hostname.len > 0:
+        if not isIpAddress(hostname):
+          # Set the SNI address for this connection. This call can fail if
+          # we're not using TLSv1+.
+          # RFC 6066 does not allow IP addresses as SNI host names.
+          discard SSL_set_tlsext_host_name(socket.sslHandle, hostname)
+        socket.sslVerifyHost = hostname
       sslSetConnectState(socket.sslHandle)
     of handshakeAsServer:
       sslSetAcceptState(socket.sslHandle)
@@ -840,7 +911,7 @@ proc sendTo*(socket: AsyncSocket, address: string, port: Port, data: string,
   var
     it = aiList
     success = false
-    lastException: ref Exception
+    lastException: ref Exception = nil
 
   while it != nil:
     let fut = sendTo(socket.fd.AsyncFD, cstring(data), len(data), it.ai_addr,
@@ -857,7 +928,7 @@ proc sendTo*(socket: AsyncSocket, address: string, port: Port, data: string,
 
     it = it.ai_next
 
-  freeaddrinfo(aiList)
+  freeAddrInfo(aiList)
 
   if not success:
     if lastException != nil:
@@ -905,16 +976,16 @@ proc recvFrom*(socket: AsyncSocket, data: FutureVar[string], size: int,
          "Cannot `recvFrom` on a TCP socket. Use `recv` or `recvInto` instead")
   assert(not socket.closed, "Cannot `recvFrom` on a closed socket")
   assert(size == len(data.mget()),
-         "`date` was not initialized correctly. `size` != `len(data.mget())`")
+         "`data` was not initialized correctly. `size` != `len(data.mget())`")
   assert(46 == len(address.mget()),
          "`address` was not initialized correctly. 46 != `len(address.mget())`")
 
   case socket.domain
   of AF_INET6:
-    var sAddr: Sockaddr_in6
+    var sAddr: Sockaddr_in6 = default(Sockaddr_in6)
     adaptRecvFromToDomain(AF_INET6)
   of AF_INET:
-    var sAddr: Sockaddr_in
+    var sAddr: Sockaddr_in = default(Sockaddr_in)
     adaptRecvFromToDomain(AF_INET)
   else:
     raise newException(ValueError, "Unknown socket address family")

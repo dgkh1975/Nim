@@ -1,4 +1,5 @@
 discard """
+matrix: "--mm:refc; --mm:orc"
 joinable: false
 """
 
@@ -9,10 +10,11 @@ because it'd need cleanup up stdout
 see also: tests/osproc/*.nim; consider merging those into a single test here
 (easier to factor and test more things as a single self contained test)
 ]#
+import std/[assertions, syncio]
 
 when defined(case_testfile): # compiled test file for child process
   from posix import exitnow
-  proc c_exit2(code: c_int): void {.importc: "_exit", header: "<unistd.h>".}
+  proc c_exit2(code: cint): void {.importc: "_exit", header: "<unistd.h>".}
   import os
   var a = 0
   proc fun(b = 0) =
@@ -29,6 +31,12 @@ when defined(case_testfile): # compiled test file for child process
     case arg
     of "exit_0":
       if true: quit(0)
+    of "exit_1":
+      if true: quit(1)
+    of "exit_2":
+      if true: quit(2)
+    of "exit_42":
+      if true: quit(42)
     of "exitnow_139":
       if true: exitnow(139)
     of "c_exit2_139":
@@ -86,9 +94,7 @@ else: # main driver
   const sourcePath = currentSourcePath()
   let dir = getCurrentDir() / "tests" / "osproc"
 
-  template deferScoped(cleanup, body) =
-    # pending https://github.com/nim-lang/RFCs/issues/236#issuecomment-646855314
-    # xxx move to std/sugar or (preferably) some low level module
+  template deferring(cleanup, body) =
     try: body
     finally: cleanup
 
@@ -96,9 +102,25 @@ else: # main driver
   # note: this should be exported in posix.nim
   proc c_system(cmd: cstring): cint {.importc: "system", header: "<stdlib.h>".}
 
+  # Every artifact built below used to be shared by all the matrix entries
+  # (`--mm:refc`/`--mm:orc`, `c`/`cpp`): one output path, and one *default*
+  # nimcache, since `-d:case_testfileX` does not affect the cache path either.
+  # Two testament processes running this test at once would then clobber each
+  # other mid-compile, and even run serially the entries thrash a single cache.
+  # Key both by the entry instead.
+  const variant =
+    (if defined(objc): "objc" elif defined(cpp): "cpp" else: "c") & "_" &
+    (if compileOption("mm", "orc"): "orc"
+     elif compileOption("mm", "arc"): "arc"
+     elif compileOption("mm", "atomicArc"): "atomicArc"
+     else: "refc")
+
   proc compileNimProg(opt: string, name: string): string =
-    result = buildDir / name.addFileExt(ExeExt)
-    let cmd = "$# c -o:$# --hints:off $# $#" % [nim.quoteShell, result.quoteShell, opt, sourcePath.quoteShell]
+    let prog = name & '_' & variant
+    result = buildDir / prog.addFileExt(ExeExt)
+    let cmd = "$# c -o:$# --nimcache:$# --hints:off $# $#" %
+      [nim.quoteShell, result.quoteShell, (buildDir / "nimcache" / prog).quoteShell,
+       opt, sourcePath.quoteShell]
     doAssert c_system(cmd) == 0, $cmd
     doAssert result.fileExists
 
@@ -113,7 +135,17 @@ else: # main driver
     runTest("exit_0", 0)
     runTest("exitnow_139", 139)
     runTest("c_exit2_139", 139)
-    runTest("quit_139", 139)
+    when defined(posix):
+      runTest("quit_139", 127) # The quit value gets saturated to 127
+    else:
+      runTest("quit_139", 139)
+
+  block execCmdTest:
+    let output = compileNimProg("-d:release -d:case_testfile", "D20220705T221100")
+    doAssert execCmd(output & " exit_0") == 0
+    doAssert execCmd(output & " exit_1") == 1
+    doAssert execCmd(output & " exit_2") == 2
+    doAssert execCmd(output & " exit_42") == 42
 
   import std/streams
 
@@ -232,14 +264,14 @@ else: # main driver
     var x = newStringOfCap(120)
     block: # startProcess stdout poStdErrToStdOut (replaces old test `tstdout` + `ta_out`)
       var p = startProcess(output, dir, options={poStdErrToStdOut})
-      deferScoped: p.close()
+      deferring: p.close()
       do:
         var sout: seq[string]
         while p.outputStream.readLine(x): sout.add x
         doAssert sout == @["start ta_out", "to stdout", "to stdout", "to stderr", "to stderr", "to stdout", "to stdout", "end ta_out"]
     block: # startProcess stderr (replaces old test `tstderr` + `ta_out`)
       var p = startProcess(output, dir, options={})
-      deferScoped: p.close()
+      deferring: p.close()
       do:
         var serr, sout: seq[string]
         while p.errorStream.readLine(x): serr.add x
@@ -268,9 +300,15 @@ else: # main driver
 
   import std/strtabs
   block execProcessTest:
-    var result = execCmdEx("nim r --hints:off -", options = {}, input = "echo 3*4")
+    # `nim r -` always names the program `stdinfile` and puts both the objects
+    # and the linked binary in that one nimcache, so without `--nimcache:` every
+    # entry here — and any other `nim r -` running at the same time — compiles
+    # and links through the same paths.
+    let stdinCache = buildDir / "nimcache" / ("stdinfile_" & variant)
+    var result = execCmdEx("nim r --hints:off --nimcache:" & stdinCache.quoteShell &
+                           " -", options = {}, input = "echo 3*4")
     stripLineEnd(result[0])
-    doAssert result == ("12", 0)
+    doAssert result == ("12", 0), $result
     when not defined(windows):
       doAssert execCmdEx("ls --nonexistent").exitCode != 0
     when false:

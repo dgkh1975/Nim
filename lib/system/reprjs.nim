@@ -8,7 +8,12 @@
 #
 # The generic ``repr`` procedure for the javascript backend.
 
+when defined(nimPreviewSlimSystem):
+  import std/formatfloat
+
 proc reprInt(x: int64): string {.compilerproc.} = $x
+proc reprInt(x: uint64): string {.compilerproc.} = $x
+proc reprInt(x: int): string {.compilerproc.} = $x
 proc reprFloat(x: float): string {.compilerproc.} = $x
 
 proc reprPointer(p: pointer): string {.compilerproc.} =
@@ -24,7 +29,7 @@ proc reprBool(x: bool): string {.compilerRtl.} =
 proc reprEnum(e: int, typ: PNimType): string {.compilerRtl.} =
   var tmp: bool
   let item = typ.node.sons[e]
-  {.emit: "`tmp` = `item` !== undefined".}
+  {.emit: "`tmp` = `item` !== undefined;".}
   if tmp:
     result = makeNimstrLit(item.name)
   else:
@@ -115,7 +120,6 @@ proc reprArray(a: pointer, typ: PNimType,
   # We prepend @ to seq, the C backend prepends the pointer to the seq.
   result = if typ.kind == tySequence: "@[" else: "["
   var len: int = 0
-  var i: int = 0
 
   {. emit: "`len` = `a`.length;\n" .}
   var dereffed: pointer = a
@@ -132,7 +136,7 @@ proc reprArray(a: pointer, typ: PNimType,
   add(result, "]")
 
 proc isPointedToNil(p: pointer): bool =
-  {. emit: "if (`p` === null) {`result` = true};\n" .}
+  {. emit: "if (`p` === null) {`result` = true;}\n" .}
 
 proc reprRef(result: var string, p: pointer, typ: PNimType,
           cl: var ReprClosure) =
@@ -149,27 +153,53 @@ proc reprRef(result: var string, p: pointer, typ: PNimType,
     """ .}
   reprAux(result, p, typ.base, cl)
 
-proc reprRecordAux(result: var string, o: pointer, typ: PNimType, cl: var ReprClosure) =
-  add(result, "[")
-
-  var first = true
-  var val = o
-  if typ.node.len == 0:
-    # if the object has only one field, len is 0  and sons is nil, the field is in node
-    let key: cstring = typ.node.name
-    add(result, $key & " = ")
-    {. emit: "`val` = `o`[`key`];\n" .}
-    reprAux(result, val, typ.node.typ, cl)
-  else:
-    # if the object has more than one field, sons is not nil and contains the fields.
-    for i in 0 .. typ.node.len-1:
+proc reprFieldsAux(result, prefix: var string; o: pointer; n: ptr TNimNode;
+                   first: var bool; cl: var ReprClosure) =
+  ## The fields of the node `n` of an object type; of a case object only
+  ## the discriminator and the fields of the active branch.
+  case n.kind
+  of nkSlot, nkCase:
+    var val: pointer = nil
+    {. emit: "`val` = `o`[`n`.offset];\n" .}
+    if n.kind == nkCase and $n.name == "`kind":
+      # the hidden discriminator of a sum type names the branch:
+      reprAux(prefix, val, n.typ, cl)
+    else:
       if first: first = false
       else: add(result, ",\n")
+      add(result, $n.name & " = ")
+      reprAux(result, val, n.typ, cl)
+    if n.kind == nkCase:
+      var branch: ptr TNimNode = nil
+      {. emit: """
+      for (var i = 0; i < `n`.sons.length; ++i) {
+        if (`n`.sons[i][0][`val`] !== undefined) { `branch` = `n`.sons[i][1]; break; }
+      }
+      if (`branch` === null) {
+        for (var i = 0; i < `n`.sons.length; ++i) {
+          if (`n`.sons[i][0][`n`.len] !== undefined) { `branch` = `n`.sons[i][1]; break; }
+        }
+      }
+      """ .}
+      if branch != nil: reprFieldsAux(result, prefix, o, branch, first, cl)
+  of nkList:
+    var len = 0
+    {. emit: "`len` = `n`.sons.length;\n" .}
+    for i in 0 ..< len:
+      var son: ptr TNimNode = nil
+      {. emit: "`son` = `n`.sons[`i`];\n" .}
+      reprFieldsAux(result, prefix, o, son, first, cl)
+  of nkNone: discard
 
-      let key: cstring = typ.node.sons[i].name
-      add(result, $key & " = ")
-      {. emit: "`val` = `o`[`key`];\n" .} # access the field by name
-      reprAux(result, val, typ.node.sons[i].typ, cl)
+proc reprRecordAux(result: var string, o: pointer, typ: PNimType, cl: var ReprClosure) =
+  var first = true
+  var prefix = ""
+  var fields = ""
+  if typ.node != nil:
+    reprFieldsAux(fields, prefix, o, typ.node, first, cl)
+  add(result, prefix)
+  add(result, "[")
+  add(result, fields)
   add(result, "]")
 
 proc reprRecord(o: pointer, typ: PNimType, cl: var ReprClosure): string {.compilerRtl.} =
@@ -190,8 +220,12 @@ proc reprAux(result: var string, p: pointer, typ: PNimType,
     return
   dec(cl.recDepth)
   case typ.kind
-  of tyInt..tyInt64, tyUInt..tyUInt64:
+  of tyInt..tyInt32, tyUInt..tyUInt32:
     add(result, reprInt(cast[int](p)))
+  of tyInt64:
+    add(result, reprInt(cast[int64](p)))
+  of tyUInt64:
+    add(result, reprInt(cast[uint64](p)))
   of tyChar:
     add(result, reprChar(cast[char](p)))
   of tyBool:

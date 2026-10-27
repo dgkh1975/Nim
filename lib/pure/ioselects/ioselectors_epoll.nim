@@ -7,12 +7,24 @@
 #    distribution, for details about the copyright.
 #
 
-# This module implements Linux epoll().
+# This module implements Linux and illumos epoll().
 
-import posix, times, epoll
+import std/[posix, times, epoll]
 
 # Maximum number of events that can be returned
 const MAX_EPOLL_EVENTS = 64
+
+# illumos uses Linux-compatible flags here, not its native O_* values.
+var
+  EFD_CLOEXEC {.importc, header: "<sys/eventfd.h>".}: cint
+  EFD_NONBLOCK {.importc, header: "<sys/eventfd.h>".}: cint
+  TFD_CLOEXEC {.importc, header: "<sys/timerfd.h>".}: cint
+  TFD_NONBLOCK {.importc, header: "<sys/timerfd.h>".}: cint
+
+when not defined(android):
+  var
+    SFD_CLOEXEC {.importc, header: "<sys/signalfd.h>".}: cint
+    SFD_NONBLOCK {.importc, header: "<sys/signalfd.h>".}: cint
 
 when not defined(android):
   type
@@ -34,7 +46,10 @@ when not defined(android):
       ssi_utime*: uint64
       ssi_stime*: uint64
       ssi_addr*: uint64
-      pad* {.importc: "__pad".}: array[0..47, uint8]
+      when defined(illumos):
+        pad* {.importc: "ssi_pad".}: array[0..47, uint8]
+      else:
+        pad* {.importc: "__pad".}: array[0..47, uint8]
 
 proc timerfd_create(clock_id: ClockId, flags: cint): cint
      {.cdecl, importc: "timerfd_create", header: "<sys/timerfd.h>".}
@@ -72,16 +87,18 @@ type
   SelectEvent* = ptr SelectEventImpl
 
 proc newSelector*[T](): Selector[T] =
+  proc initialNumFD(): int {.inline.} =
+    when defined(nuttx):
+      result = NEPOLL_MAX
+    else:
+      result = 1024
   # Retrieve the maximum fd count (for current OS) via getrlimit()
-  var a = RLimit()
-  if getrlimit(posix.RLIMIT_NOFILE, a) != 0:
-    raiseOSError(osLastError())
-  var maxFD = int(a.rlim_max)
+  var maxFD = maxDescriptors()
   doAssert(maxFD > 0)
   # Start with a reasonable size, checkFd() will grow this on demand
-  const numFD = 1024
+  let numFD = initialNumFD()
 
-  var epollFD = epoll_create1(O_CLOEXEC)
+  var epollFD = epoll_create1(EPOLL_CLOEXEC)
   if epollFD < 0:
     raiseOSError(osLastError())
 
@@ -110,7 +127,7 @@ proc close*[T](s: Selector[T]) =
     raiseIOSelectorsError(osLastError())
 
 proc newSelectEvent*(): SelectEvent =
-  let fdci = eventfd(0, O_CLOEXEC or O_NONBLOCK)
+  let fdci = eventfd(0, EFD_CLOEXEC or EFD_NONBLOCK)
   if fdci == -1:
     raiseIOSelectorsError(osLastError())
   result = cast[SelectEvent](allocShared0(sizeof(SelectEventImpl)))
@@ -136,7 +153,7 @@ template checkFd(s, f) =
     var numFD = s.numFD
     while numFD <= f: numFD *= 2
     when hasThreadSupport:
-      s.fds = reallocSharedArray(s.fds, numFD)
+      s.fds = reallocSharedArray(s.fds, s.numFD, numFD)
     else:
       s.fds.setLen(numFD)
     for i in s.numFD ..< numFD:
@@ -268,7 +285,7 @@ proc registerTimer*[T](s: Selector[T], timeout: int, oneshot: bool,
   var
     newTs: Itimerspec
     oldTs: Itimerspec
-  let fdi = timerfd_create(CLOCK_MONOTONIC, O_CLOEXEC or O_NONBLOCK).int
+  let fdi = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC or TFD_NONBLOCK).int
   if fdi == -1:
     raiseIOSelectorsError(osLastError())
 
@@ -312,7 +329,7 @@ when not defined(android):
     discard sigaddset(nmask, cint(signal))
     blockSignals(nmask, omask)
 
-    let fdi = signalfd(-1, nmask, O_CLOEXEC or O_NONBLOCK).int
+    let fdi = signalfd(-1, nmask, SFD_CLOEXEC or SFD_NONBLOCK).int
     if fdi == -1:
       raiseIOSelectorsError(osLastError())
 
@@ -338,7 +355,7 @@ when not defined(android):
     discard sigaddset(nmask, posix.SIGCHLD)
     blockSignals(nmask, omask)
 
-    let fdi = signalfd(-1, nmask, O_CLOEXEC or O_NONBLOCK).int
+    let fdi = signalfd(-1, nmask, SFD_CLOEXEC or SFD_NONBLOCK).int
     if fdi == -1:
       raiseIOSelectorsError(osLastError())
 
@@ -356,6 +373,7 @@ when not defined(android):
 
 proc registerEvent*[T](s: Selector[T], ev: SelectEvent, data: T) =
   let fdi = int(ev.efd)
+  s.checkFd(fdi)
   doAssert(s.fds[fdi].ident == InvalidIdent, "Event is already registered in the queue!")
   s.setKey(fdi, {Event.User}, 0, data)
   var epv = EpollEvent(events: EPOLLIN or EPOLLRDHUP)
@@ -493,7 +511,7 @@ template isEmpty*[T](s: Selector[T]): bool =
   (s.count == 0)
 
 proc contains*[T](s: Selector[T], fd: SocketHandle|int): bool {.inline.} =
-  return s.fds[fd.int].ident != InvalidIdent
+  return fd.int < s.numFD and s.fds[fd.int].ident != InvalidIdent
 
 proc getData*[T](s: Selector[T], fd: SocketHandle|int): var T =
   let fdi = int(fd)
@@ -529,4 +547,4 @@ template withData*[T](s: Selector[T], fd: SocketHandle|int, value, body1,
     body2
 
 proc getFd*[T](s: Selector[T]): int =
-  return s.epollFd.int
+  return s.epollFD.int

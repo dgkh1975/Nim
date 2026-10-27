@@ -1,4 +1,9 @@
+discard """
+  matrix: "--mm:refc; --mm:orc"
+"""
+
 import std/wordwrap
+import std/assertions
 
 when true:
   let
@@ -24,11 +29,11 @@ iaoenvlcyfglwckßqfgvwkßqgfvlwkßqfgvlwckßqvlwkgfUIαοιαοιαχολωχσ�
 ξχλωωχαοεοιαεοαεοιαεοαεοιαοεσναοεκνρκψγκψφϵιηαααοε"""
 let longlongwordRes = """
 abc uitdaeröägfßhydüäpydqfü,träpydqgpmüdträpydföägpydörztdüöäfguiaeowäzjdtrüöäp
-psnrtuiydrözenrüöäpyfdqazpesnrtulocjtüöäzydgyqgfqfgprtnwjlcydkqgfüöezmäzydydqüü
+psnrtuiydrözenrüöäpyfdqazpesnrtulocjtüö äzydgyqgfqfgprtnwjlcydkqgfüöezmäzydydqüü
 öäpdtrnvwfhgckdumböäpydfgtdgfhtdrntdrntydfogiayqfguiatrnydrntüöärtniaoeydfgaoeiq
-fglwcßqfgxvlcwgtfhiaoenrsüöäapmböäptdrniaoydfglckqfhouenrtsüöäptrniaoeyqfgulocf
+fglwcßqfgxvlcwgtfhiaoen rsüöäapmböäptdrniaoydfglckqfhouenrtsüöäptrniaoeyqfgulocf
 qclgwxßqflgcwßqfxglcwrniatrnmüböäpmöäbpümöäbpüöämpbaoestnriaesnrtdiaesrtdniaesdr
-tnaetdriaoenvlcyfglwckßqfgvwkßqgfvlwkßqfgvlwckßqvlwkgfUIαοιαοιαχολωχσωχνωκψρχκψ
+tnaetdr iaoenvlcyfglwckßqfgvwkßqgfvlwkßqfgvlwckßqvlwkgfUIαοιαοιαχολωχσωχνωκψρχκψ
 ρτιεαοσηζϵηζιοεννκεωνιαλωσωκνκψρκγτφγτχκγτεκργτιχνκιωχσιλωσλωχξλξλξωχωχ
 ξχλωωχαοεοιαεοαεοιαεοαεοιαοεσναοεκνρκψγκψφϵιηαααοε"""
 doAssert wrapWords(longlongword) == longlongwordRes

@@ -8,6 +8,7 @@ false
 false
 false
 Foo
+foo
 '''
 """
 
@@ -134,15 +135,31 @@ block tRequiresInit:
   reject:
     var s: DistinctString
     s = "test"
-    doAssert s == "test"
+    doAssert string(s) == "test"
 
   accept:
-    let s = "test"
-    doAssert s == "test"
+    let s = DistinctString("test")
+    doAssert string(s) == "test"
+
+block: #17322
+  type
+    A[T] = distinct string
+
+  proc foo(a: var A) =
+    a.string.add "foo"
+
+  type
+    B = distinct A[int]
+
+  var b: B
+  foo(A[int](b))
+  echo A[int](b).string
+  b.string.add "bar"
+  assert b.string == "foobar"
 
 type Foo = distinct string
 
-template main() =
+proc main() = # proc instead of template because of MCS/UFCS.
   # xxx put everything here to test under RT + VM
   block: # bug #12282
     block:
@@ -181,6 +198,30 @@ template main() =
       discard cast[B](A(1))
       var c: B
 
+
+  block: # bug #9423
+    block:
+      type Foo = seq[int]
+      type Foo2 = distinct Foo
+      template fn() =
+        var a = Foo2(@[1])
+        a.Foo.add 2
+        doAssert a.Foo == @[1, 2]
+      fn()
+
+    block:
+      type Stack[T] = distinct seq[T]
+      proc newStack[T](): Stack[T] =
+        Stack[T](newSeq[T]())
+      proc push[T](stack: var Stack[T], elem: T) =
+        seq[T](stack).add(elem)
+      proc len[T](stack: Stack[T]): int =
+        seq[T](stack).len
+      proc fn() = 
+        var stack = newStack[int]()
+        stack.push(5)
+        doAssert stack.len == 1
+      fn()
 
 static: main()
 main()

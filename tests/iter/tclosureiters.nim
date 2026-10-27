@@ -1,4 +1,5 @@
 discard """
+  targets: "c js"
   output: '''0
 1
 2
@@ -21,6 +22,15 @@ discard """
 2
 70
 0
+(1, 1)
+(1, 2)
+(1, 3)
+(2, 1)
+(2, 2)
+(2, 3)
+(3, 1)
+(3, 2)
+(3, 3)
 '''
 """
 
@@ -143,12 +153,95 @@ iterator filesIt(path: string): auto {.closure.} =
       yield prefix / f
 
 # bug #13815
-var love = iterator: int {.closure.} =
-  yield cast[type(
-    block:
-      var a = 0
-      yield a
-      a)](0)
+when not defined(js):
+  var love = iterator: int {.closure.} =
+    yield cast[type(
+      block:
+        var a = 0
+        yield a
+        a)](0)
 
-for i in love():
-  echo i
+  for i in love():
+    echo i
+else:
+  echo 0
+
+# bug #18474
+iterator pairs(): (int, int) {.closure.} =
+  for i in 1..3:
+    for j in 1..3:
+      yield (i, j)
+
+for pair in pairs():
+  echo pair
+
+# issue #26158: static array literals containing strings must be copied safely
+# when a closure iterator stores them in its environment.
+iterator fromStatic(): int {.closure.} =
+  for _ in static([(" ",)]):
+    break
+
+for _ in fromStatic():
+  break
+
+iterator fromLiteral(): int {.closure.} =
+  for _ in [(" ",)]:
+    break
+
+for _ in fromLiteral():
+  break
+
+# yeild in stmtlist expression
+var calls = 0
+
+proc value(): int {.discardable.} =
+  inc calls
+  1
+
+iterator branch(flag: bool): int {.closure.} =
+  if flag:
+    yield 1
+    # The result is allowed to go unused, but this branch remains typed.
+    value()
+  else:
+    discard
+  yield 2
+
+iterator repeated(): int {.closure.} =
+  for i in 0..<2:
+    yield i
+    value()
+
+iterator retained(): int {.closure.} =
+  let n = if true:
+      yield 3
+      4
+    else:
+      5
+  yield n
+
+var seen: seq[int] = @[]
+for x in branch(false):
+  seen.add x
+doAssert seen == @[2]
+doAssert calls == 0
+
+seen.setLen(0)
+for x in branch(true):
+  seen.add x
+doAssert seen == @[1, 2]
+doAssert calls == 1
+
+seen.setLen(0)
+for x in repeated():
+  seen.add x
+doAssert seen == @[0, 1]
+doAssert calls == 3
+
+seen.setLen(0)
+for x in retained():
+  seen.add x
+doAssert seen == @[3, 4]
+
+
+

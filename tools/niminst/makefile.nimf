@@ -16,6 +16,7 @@ endif
 
 target := ?{"$(binDir)/" & toLowerAscii(c.name)}
 
+
 ucpu := $(shell sh -c 'uname -m | tr "[:upper:]" "[:lower:]"')
 ifeq ($(OS),Windows_NT)
   uos := windows
@@ -44,6 +45,7 @@ endif
 ifeq ($(uos),netbsd)
   myos = netbsd
   LDFLAGS += -lm
+  ucpu = $(shell sh -c 'uname -p')
 endif
 ifeq ($(uos),darwin)
   myos = macosx
@@ -57,12 +59,16 @@ ifeq ($(uos),aix)
   myos = aix
   LDFLAGS += -dl -lm
 endif
-ifeq ($(uos),solaris)
-  myos = solaris
-  LDFLAGS += -ldl -lm -lsocket -lnsl
-endif
-ifeq ($(uos),sun)
-  myos = solaris
+ifneq ($(filter sunos solaris illumos,$(uos)),)
+  myos = $(uos)
+  ifeq ($(uos),sunos)
+    sunosname := $(shell sh -c 'uname -o 2>/dev/null | tr "[:upper:]" "[:lower:]"')
+    ifeq ($(sunosname),illumos)
+      myos = illumos
+    else
+      myos = solaris
+    endif
+  endif
   LDFLAGS += -ldl -lm -lsocket -lnsl
 endif
 ifeq ($(uos),haiku)
@@ -93,6 +99,14 @@ ifeq ($(ucpu),bepc)
 endif
 ifeq ($(ucpu),i86pc)
   mycpu = i386
+  ifneq ($(filter solaris illumos,$(myos)),)
+    bits := $(shell isainfo -b)
+    ifeq ($(bits),64)
+      mycpu = amd64
+      CFLAGS += -m64
+      LDFLAGS += -m64
+    endif
+  endif
 endif
 ifeq ($(ucpu),amd64)
   mycpu = amd64
@@ -103,8 +117,17 @@ endif
 ifeq ($(ucpu),x86_64)
   mycpu = amd64
 endif
+ifeq ($(ucpu),parisc64)
+  mycpu = hppa
+endif
+ifeq ($(ucpu),s390x)
+  mycpu = s390x
+endif
 ifeq ($(ucpu),sparc)
   mycpu = sparc
+endif
+ifeq ($(ucpu),sparc64)
+  mycpu = sparc64
 endif
 ifeq ($(ucpu),sun)
   mycpu = sparc
@@ -131,7 +154,7 @@ ifeq ($(ucpu),powerpc)
   endif
 endif
 ifeq ($(ucpu),ppc)
-  mycpu = ppc
+   mycpu = powerpc
 endif
 ifneq (,$(filter $(ucpu), mips mips64))
   mycpu = $(shell /bin/sh -c '"$(CC)" -dumpmachine | sed "s/-.*//"')
@@ -163,8 +186,17 @@ endif
 ifeq ($(ucpu),aarch64)
   mycpu = arm64
 endif
+ifeq ($(ucpu),arm64)
+  mycpu = arm64
+endif
 ifeq ($(ucpu),riscv64)
   mycpu = riscv64
+endif
+ifeq ($(ucpu),e2k)
+  mycpu = e2k
+endif
+ifeq ($(ucpu),loongarch64)
+  mycpu = loongarch64
 endif
 ifndef mycpu
   $(error unknown CPU architecture: $(ucpu) See makefile.nimf)

@@ -9,6 +9,7 @@
 
 import sequtils, parseutils, strutils, os, streams, parsecfg,
   tables, hashes, sets
+import compiler/platform
 
 type TestamentData* = ref object
   # better to group globals under 1 object; could group the other ones here too
@@ -23,6 +24,7 @@ var compilerPrefix* = findExe("nim")
 let isTravis* = existsEnv("TRAVIS")
 let isAppVeyor* = existsEnv("APPVEYOR")
 let isAzure* = existsEnv("TF_BUILD")
+let isGithubActions* = existsEnv("GITHUB_ACTIONS")
 
 var skips*: seq[string]
 
@@ -55,6 +57,7 @@ type
     reJoined,          # test is disabled because it was joined into the megatest
     reSuccess          # test was successful
     reInvalidSpec      # test had problems to parse the spec
+    reRetry            # test is being retried
 
   TTarget* = enum
     targetC = "c"
@@ -74,6 +77,7 @@ type
     # xxx make sure `isJoinableSpec` takes into account each field here.
     action*: TTestAction
     file*, cmd*: string
+    filename*: string ## Test filename (without path).
     input*: string
     outputCheck*: TOutputCheck
     sortoutput*: bool
@@ -100,10 +104,11 @@ type
                       # but don't rely on much precision
     inlineErrors*: seq[InlineError] # line information to error message
     debugInfo*: string # debug info to give more context
+    retries*: int # number of retry attempts after the test fails
 
 proc getCmd*(s: TSpec): string =
   if s.cmd.len == 0:
-    result = compilerPrefix & " $target --hints:on -d:testing --clearNimblePath --nimblePath:build/deps/pkgs $options $file"
+    result = compilerPrefix & " $target --hints:on -d:testing --nimblePath:build/deps/pkgs2 $options $file"
   else:
     result = s.cmd
 
@@ -126,19 +131,55 @@ when not declared(parseCfgBool):
     of "n", "no", "false", "0", "off": result = false
     else: raise newException(ValueError, "cannot interpret as a bool: " & s)
 
+proc addLine*(self: var string; pieces: varargs[string]) =
+  for piece in pieces:
+    self.add piece
+  self.add "\n"
+
+
 const
-  inlineErrorMarker = "#[tt."
+  inlineErrorKindMarker = "tt."
+  inlineErrorMarker = "#[" & inlineErrorKindMarker
 
 proc extractErrorMsg(s: string; i: int; line: var int; col: var int; spec: var TSpec): int =
+  ## Extract inline error messages.
+  ##
+  ## Can parse a single message for a line:
+  ##
+  ##   ```nim
+  ##   proc generic_proc*[T] {.no_destroy, userPragma.} = #[tt.Error
+  ##        ^ 'generic_proc' should be: 'genericProc' [Name] ]#
+  ##   ```
+  ##
+  ## Can parse multiple messages for a line when they are separated by ';':
+  ##
+  ##   ```nim
+  ##   proc generic_proc*[T] {.no_destroy, userPragma.} = #[tt.Error
+  ##        ^ 'generic_proc' should be: 'genericProc' [Name]; tt.Error
+  ##                           ^ 'no_destroy' should be: 'nodestroy' [Name]; tt.Error
+  ##                                       ^ 'userPragma' should be: 'user_pragma' [template declared in mstyleCheck.nim(10, 9)] [Name] ]#
+  ##   ```
+  ##
+  ##   ```nim
+  ##   proc generic_proc*[T] {.no_destroy, userPragma.} = #[tt.Error
+  ##        ^ 'generic_proc' should be: 'genericProc' [Name];
+  ##     tt.Error              ^ 'no_destroy' should be: 'nodestroy' [Name];
+  ##     tt.Error                          ^ 'userPragma' should be: 'user_pragma' [template declared in mstyleCheck.nim(10, 9)] [Name] ]#
+  ##   ```
   result = i + len(inlineErrorMarker)
   inc col, len(inlineErrorMarker)
+  let msgLine = line
+  var msgCol = -1
+  var msg = ""
   var kind = ""
-  while result < s.len and s[result] in IdentChars:
-    kind.add s[result]
-    inc result
-    inc col
 
-  var caret = (line, -1)
+  template parseKind =
+    while result < s.len and s[result] in IdentChars:
+      kind.add s[result]
+      inc result
+      inc col
+    if kind notin ["Hint", "Warning", "Error"]:
+      spec.parseErrors.addLine "expected inline message kind: Hint, Warning, Error"
 
   template skipWhitespace =
     while result < s.len and s[result] in Whitespace:
@@ -149,33 +190,72 @@ proc extractErrorMsg(s: string; i: int; line: var int; col: var int; spec: var T
         inc col
       inc result
 
-  skipWhitespace()
-  if result < s.len and s[result] == '^':
-    caret = (line-1, col)
-    inc result
-    inc col
-    skipWhitespace()
+  template parseCaret =
+    if result < s.len and s[result] == '^':
+      msgCol = col
+      inc result
+      inc col
+      skipWhitespace()
+    else:
+      spec.parseErrors.addLine "expected column marker ('^') for inline message"
 
-  var msg = ""
+  template isMsgDelimiter: bool =
+    s[result] == ';' and
+    (block:
+      let nextTokenIdx = result + 1 + parseutils.skipWhitespace(s, result + 1)
+      if s.len > nextTokenIdx + len(inlineErrorKindMarker) and
+         s[nextTokenIdx..(nextTokenIdx + len(inlineErrorKindMarker) - 1)] == inlineErrorKindMarker:
+        true
+      else:
+        false)
+
+  template trimTrailingMsgWhitespace =
+    while msg.len > 0 and msg[^1] in Whitespace:
+      setLen msg, msg.len - 1
+
+  template addInlineError =
+    doAssert msg[^1] notin Whitespace
+    if kind == "Error": spec.action = actionReject
+    spec.inlineErrors.add InlineError(kind: kind, msg: msg, line: msgLine, col: msgCol)
+
+  parseKind()
+  skipWhitespace()
+  parseCaret()
+
   while result < s.len-1:
     if s[result] == '\n':
+      if result > 0 and s[result - 1] == '\r':
+        msg[^1] = '\n'
+      else:
+        msg.add '\n'
       inc result
       inc line
       col = 1
-    elif s[result] == ']' and s[result+1] == '#':
-      while msg.len > 0 and msg[^1] in Whitespace:
-        setLen msg, msg.len - 1
-
+    elif isMsgDelimiter():
+      trimTrailingMsgWhitespace()
       inc result
+      skipWhitespace()
+      addInlineError()
+      inc result, len(inlineErrorKindMarker)
+      inc col, 1 + len(inlineErrorKindMarker)
+      kind.setLen 0
+      msg.setLen 0
+      parseKind()
+      skipWhitespace()
+      parseCaret()
+    elif s[result] == ']' and s[result+1] == '#':
+      trimTrailingMsgWhitespace()
+      inc result, 2
       inc col, 2
-      if kind == "Error": spec.action = actionReject
-      spec.unjoinable = true
-      spec.inlineErrors.add InlineError(kind: kind, msg: msg, line: caret[0], col: caret[1])
+      addInlineError()
       break
     else:
       msg.add s[result]
       inc result
       inc col
+
+  if spec.inlineErrors.len > 0:
+    spec.unjoinable = true
 
 proc extractSpec(filename: string; spec: var TSpec): string =
   const
@@ -220,6 +300,7 @@ proc extractSpec(filename: string; spec: var TSpec): string =
     result = ""
 
 proc parseTargets*(value: string): set[TTarget] =
+  result = default(set[TTarget])
   for v in value.normalize.splitWhitespace:
     case v
     of "c": result.incl(targetC)
@@ -228,31 +309,26 @@ proc parseTargets*(value: string): set[TTarget] =
     of "js": result.incl(targetJS)
     else: raise newException(ValueError, "invalid target: '$#'" % v)
 
-proc addLine*(self: var string; a: string) =
-  self.add a
-  self.add "\n"
-
-proc addLine*(self: var string; a, b: string) =
-  self.add a
-  self.add b
-  self.add "\n"
-
 proc initSpec*(filename: string): TSpec =
-  result.file = filename
+  result = TSpec(file: filename)
 
 proc isCurrentBatch*(testamentData: TestamentData; filename: string): bool =
   if testamentData.testamentNumBatch != 0:
-    hash(filename) mod testamentData.testamentNumBatch == testamentData.testamentBatch
+    let count = testamentData.testamentNumBatch
+    # String hashes can be negative. Normalize the remainder so every test maps
+    # to one of the non-negative batch indexes instead of silently mapping to
+    # no batch at all.
+    ((hash(filename) mod count) + count) mod count == testamentData.testamentBatch
   else:
     true
 
 proc parseSpec*(filename: string): TSpec =
-  result.file = filename
+  result = TSpec(file: filename, filename: extractFilename(filename))
   let specStr = extractSpec(filename, result)
   var ss = newStringStream(specStr)
-  var p: CfgParser
+  var p: CfgParser = default(CfgParser)
   open(p, ss, filename, 1)
-  var flags: HashSet[string]
+  var flags: HashSet[string] = initHashSet[string]()
   var nimoutFound = false
   while true:
     var e = next(p)
@@ -329,42 +405,73 @@ proc parseSpec*(filename: string): TSpec =
           # Valgrind only supports OSX <= 17.x
           result.useValgrind = disabled
       of "disabled":
-        case e.value.normalize
+        let value = e.value.normalize
+        case value
         of "y", "yes", "true", "1", "on": result.err = reDisabled
         of "n", "no", "false", "0", "off": discard
-        of "win", "windows":
+        # These values are defined in `compiler/options.isDefined`
+        of "win":
           when defined(windows): result.err = reDisabled
         of "linux":
           when defined(linux): result.err = reDisabled
         of "bsd":
           when defined(bsd): result.err = reDisabled
-        of "osx", "macosx": # xxx remove `macosx` alias?
+        of "osx":
           when defined(osx): result.err = reDisabled
-        of "unix":
-          when defined(unix): result.err = reDisabled
-        of "posix":
+        of "unix", "posix":
           when defined(posix): result.err = reDisabled
+        of "freebsd":
+          when defined(freebsd): result.err = reDisabled
+        of "littleendian":
+          when defined(littleendian): result.err = reDisabled
+        of "bigendian":
+          when defined(bigendian): result.err = reDisabled
+        of "cpu8", "8bit":
+          when defined(cpu8): result.err = reDisabled
+        of "cpu16", "16bit":
+          when defined(cpu16): result.err = reDisabled
+        of "cpu32", "32bit":
+          when defined(cpu32): result.err = reDisabled
+        of "cpu64", "64bit":
+          when defined(cpu64): result.err = reDisabled
+        # These values are for CI environments
         of "travis": # deprecated
           if isTravis: result.err = reDisabled
         of "appveyor": # deprecated
           if isAppVeyor: result.err = reDisabled
-        of "azure":
+        of "azure": # deprecated
           if isAzure: result.err = reDisabled
-        of "32bit":
-          if sizeof(int) == 4:
-            result.err = reDisabled
-        of "freebsd":
-          when defined(freebsd): result.err = reDisabled
-        of "arm64":
-          when defined(arm64): result.err = reDisabled
-        of "i386":
-          when defined(i386): result.err = reDisabled
-        of "openbsd":
-          when defined(openbsd): result.err = reDisabled
-        of "netbsd":
-          when defined(netbsd): result.err = reDisabled
+        of "github":
+          if isGithubActions: result.err = reDisabled
         else:
-          result.parseErrors.addLine "cannot interpret as a bool: ", e.value
+          # Check whether the value exists as an OS or CPU that is
+          # defined in `compiler/platform`.
+          block checkHost:
+            for os in platform.OS:
+              # Check if the value exists as OS.
+              if value == os.name.normalize:
+                # The value exists; is it the same as the current host?
+                if value == hostOS.normalize:
+                  # The value exists and is the same as the current host,
+                  # so disable the test.
+                  result.err = reDisabled
+                # The value was defined, so there is no need to check further
+                # values or raise an error.
+                break checkHost
+            for cpu in platform.CPU:
+              # Check if the value exists as CPU.
+              if value == cpu.name.normalize:
+                # The value exists; is it the same as the current host?
+                if value == hostCPU.normalize:
+                  # The value exists and is the same as the current host,
+                  # so disable the test.
+                  result.err = reDisabled
+                # The value was defined, so there is no need to check further
+                # values or raise an error.
+                break checkHost
+            # The value doesn't exist as an OS, CPU, or any previous value
+            # defined in this case statement, so raise an error.
+            result.parseErrors.addLine "cannot interpret as a bool: ", e.value
       of "cmd":
         if e.value.startsWith("nim "):
           result.cmd = compilerPrefix & e.value[3..^1]
@@ -379,6 +486,8 @@ proc parseSpec*(filename: string): TSpec =
           result.timeout = parseFloat(e.value)
         except ValueError:
           result.parseErrors.addLine "cannot interpret as a float: ", e.value
+      of "retries":
+        discard parseInt(e.value, result.retries)
       of "targets", "target":
         try:
           result.targets.incl parseTargets(e.value)
@@ -409,3 +518,15 @@ proc parseSpec*(filename: string): TSpec =
   result.inCurrentBatch = isCurrentBatch(testamentData0, filename) or result.unbatchable
   if not result.inCurrentBatch:
     result.err = reDisabled
+
+  # Interpolate variables in msgs:
+  template varSub(msg: string): string =
+    try:
+      msg % ["/", $DirSep, "file", result.filename]
+    except ValueError:
+      result.parseErrors.addLine "invalid variable interpolation (see 'https://nim-lang.github.io/Nim/testament.html#writing-unit-tests-output-message-variable-interpolation')"
+      msg
+  result.nimout = result.nimout.varSub
+  result.msg = result.msg.varSub
+  for inlineError in result.inlineErrors.mitems:
+    inlineError.msg = inlineError.msg.varSub

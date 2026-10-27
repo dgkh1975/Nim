@@ -1,4 +1,5 @@
 discard """
+matrix: "--mm:refc; --mm:orc"
 sortoutput: true
 output: '''
 key1: value1
@@ -88,7 +89,7 @@ value1 = value2
 '''
 """
 
-import strtabs
+import std/[strtabs, assertions, syncio]
 
 var tab = newStringTable({"key1": "val1", "key2": "val2"},
                          modeStyleInsensitive)
@@ -114,3 +115,13 @@ block:
   x.clear(modeCaseInsensitive)
   x["11"] = "22"
   doAssert x["11"] == "22"
+
+block: # clear releases the strings held by the emptied slots
+  var t = newStringTable()
+  t["foo"] = newString(4_000_000)
+  GC_fullCollect()
+  let occupied = getOccupiedMem()
+  t.clear()
+  doAssert t.len == 0
+  GC_fullCollect()
+  doAssert occupied - getOccupiedMem() > 1_000_000

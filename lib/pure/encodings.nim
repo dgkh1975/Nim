@@ -39,9 +39,14 @@ runnableExamples:
     assert fromGB2312.convert(second) == "有白头如新，倾盖如故"
 
 
-import os
+import std/os
+when defined(nimPreviewSlimSystem):
+  import std/assertions
 
-when not defined(windows):
+when defined(musl):
+  type EncodingConverter* {.importc: "iconv_t", header: "<iconv.h>".} = pointer
+    ## Can convert between two character sets.
+elif not defined(windows):
   type
     ConverterObj = object
     EncodingConverter* = ptr ConverterObj ## Can convert between two character sets.
@@ -57,7 +62,7 @@ type
                                         ## for encoding errors.
 
 when defined(windows):
-  import parseutils, strutils
+  import std/[parseutils, strutils]
   proc eqEncodingNames(a, b: string): bool =
     var i = 0
     var j = 0
@@ -304,14 +309,14 @@ else:
     const EILSEQ = 92.cint
   elif defined(bsd):
     const EILSEQ = 86.cint
-  elif defined(solaris):
+  elif defined(sunos):
     const EILSEQ = 88.cint
   elif defined(haiku):
     const EILSEQ = -2147454938.cint
 
   var errno {.importc, header: "<errno.h>".}: cint
 
-  when defined(bsd):
+  when defined(bsd) or defined(musl):
     {.pragma: importIconv, cdecl, header: "<iconv.h>".}
     when defined(openbsd):
       {.passL: "-liconv".}
@@ -337,10 +342,10 @@ proc getCurrentEncoding*(uiApp = false): string =
 
 proc open*(destEncoding = "UTF-8", srcEncoding = "CP1252"): EncodingConverter =
   ## Opens a converter that can convert from `srcEncoding` to `destEncoding`.
-  ## Raises `IOError` if it cannot fulfill the request.
+  ## Raises `EncodingError` if it cannot fulfill the request.
   when not defined(windows):
     result = iconvOpen(destEncoding, srcEncoding)
-    if result == nil:
+    if result == cast[EncodingConverter](-1):
       raise newException(EncodingError,
         "cannot create encoding converter from " &
         srcEncoding & " to " & destEncoding)
@@ -462,24 +467,31 @@ else:
     var outLen = csize_t len(result)
     var src = cstring(s)
     var dst = cstring(result)
-    var iconvres: csize_t
+    var iconvres: csize_t = csize_t(0)
     while inLen > 0:
       iconvres = iconv(c, addr src, addr inLen, addr dst, addr outLen)
       if iconvres == high(csize_t):
         var lerr = errno
-        if lerr == EILSEQ or lerr == EINVAL:
+        if (lerr == EILSEQ or lerr == EINVAL) and outLen > 0:
           # unknown char, skip
           dst[0] = src[0]
           src = cast[cstring](cast[int](src) + 1)
           dst = cast[cstring](cast[int](dst) + 1)
           dec(inLen)
           dec(outLen)
-        elif lerr == E2BIG:
-          var offset = cast[int](dst) - cast[int](cstring(result))
-          setLen(result, len(result) + inLen.int * 2 + 5)
-          # 5 is minimally one utf-8 char
-          dst = cast[cstring](cast[int](cstring(result)) + offset)
-          outLen = csize_t(len(result) - offset)
+        elif lerr == E2BIG or lerr == EILSEQ or lerr == EINVAL:
+          # Either the output buffer is too small, or it is full and an unknown
+          # char cannot be copied over. Do not resume the conversion where it
+          # stopped: stateful encodings (ISO-2022-JP/KR/CN) can lose their shift
+          # state across a short write, which silently corrupts the tail of the
+          # output. Reset the converter and redo the whole conversion into a
+          # larger buffer instead.
+          discard iconv(c, nil, nil, nil, nil)
+          result = newString(len(result) * 2 + 16)
+          inLen = csize_t len(s)
+          outLen = csize_t len(result)
+          src = cstring(s)
+          dst = cstring(result)
         else:
           raiseOSError(lerr.OSErrorCode)
     # iconv has a buffer that needs flushing, specially if the last char is

@@ -1,11 +1,11 @@
 discard """
-  matrix: "--gc:refc; --gc:orc"
+  matrix: "--mm:refc; --mm:orc"
   targets: "c cpp js"
 """
 
 import std/deques
 from std/sequtils import toSeq
-
+import std/assertions
 
 block:
   proc index(self: Deque[int], idx: Natural): int =
@@ -62,6 +62,8 @@ block:
   block:
     var d = initDeque[int](1)
     d.addLast 7
+    doAssert d.len == 1
+    doAssert d.high == 0
     d.addLast 8
     d.addLast 10
     d.addFirst 5
@@ -74,6 +76,7 @@ block:
     doAssert($d == "[5, 7]")
     d.shrink(2, 2)
     doAssert d.len == 0
+    doAssert d.high == -1
 
   for i in -2 .. 10:
     if i in deq:
@@ -107,6 +110,7 @@ block:
   proc foo(a, b: Positive) = # assume random positive values for `a` and `b`.
     var deq = initDeque[int]()
     doAssert deq.len == 0
+    doAssert deq.high == -1
     for i in 1 .. a: deq.addLast i
 
     if b < deq.len: # checking before indexed access.
@@ -183,6 +187,95 @@ proc main() =
     clear(a)
     doAssert len(a) == 0
 
+  block: # bug #21278
+    var a = [10, 20, 30, 40].toDeque
+
+    a.shrink(fromFirst = 0, fromLast = 1)
+    doAssert $a == "[10, 20, 30]"
+
+  block:
+    var a, b: Deque[int] = initDeque[int]()
+    for i in 1 .. 256:
+      a.addLast(i)
+    for i in 1 .. 255:
+      a.popLast
+    b.addLast(1)
+    doAssert a == b
+
+  block:
+    # Issue 23275
+    # Test `==`.
+    block:
+      var a, b = initDeque[int]()
+      doAssert a == b
+      doAssert a.hash == b.hash
+      a.addFirst(1)
+      doAssert a != b
+      doAssert a.hash != b.hash
+      b.addLast(1)
+      doAssert a == b
+      doAssert a.hash == b.hash
+      a.popFirst
+      b.popLast
+      doAssert a == b
+      doAssert a.hash == b.hash
+      a.addLast 2
+      doAssert a != b
+      doAssert a.hash != b.hash
+      b.addFirst 2
+      doAssert a == b
+      doAssert a.hash == b.hash
+
+    block:
+      var a, b = initDeque[int]()
+      for i in countdown(100, 1):
+        a.addFirst(i)
+      for i in 1..100:
+        b.addLast(i)
+      doAssert a == b
+      for i in 1..99:
+        a.popLast
+      let a1 = [1].toDeque
+      doAssert a == a1
+      doAssert a.hash == a1.hash
+      var c = initDeque[int]()
+      c.addLast(1)
+      doAssert a == c
+      doAssert a.hash == c.hash
+
+block:
+  when defined(nimAllowNonVarDestructor) and defined(gcDestructors):
+    type NoCopy = object
+
+    var destroys: int
+    # TODO `var` here causes:
+    # /tdeques_d/@psystem.nim.c:6175:46: error: incompatible type for argument 1 of ‘eqdestroy__u37__tdeques’
+    proc `=destroy`(a: NoCopy) = destroys += 1
+    proc `=copy`(a: var NoCopy, b: NoCopy) {.error.}
+
+    block:
+      var _ = initDeque[NoCopy](10)
+    when false: # TODO how to get rid of seq =destroy?
+      doAssert destroys == 0, "avoid spurious destroy calls for unused items"
+
+    block: # Add and pop should work with NoCopy types
+      var d = initDeque[NoCopy]()
+      d.addFirst(NoCopy())
+      discard d.popLast()
+
+    when not declared(js): # moves broken
+      block:
+        var d = @[NoCopy()].toDequeSink()
+        doAssert(d.len == 1)
 
 static: main()
 main()
+
+# https://github.com/nim-lang/Nim/issues/18583
+# $ separator must be emitted even when the item's string repr is empty
+type EmptyStr18583 = object
+proc `$`(x: EmptyStr18583): string = ""
+
+block:
+  var d = [EmptyStr18583(), EmptyStr18583()].toDeque
+  doAssert $d == "[, ]", "got: " & $d

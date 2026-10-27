@@ -1,8 +1,9 @@
 discard """
-  targets: "c js"
+  matrix: "--mm:refc; --mm:orc; --backend:js --jsbigint64:on; --backend:js --jsbigint64:off -d:nimStringHash2"
 """
 
 import times, strutils, unittest
+import std/assertions
 
 when not defined(js):
   import os
@@ -10,17 +11,19 @@ when not defined(js):
 proc staticTz(hours, minutes, seconds: int = 0): Timezone {.noSideEffect.} =
   let offset = hours * 3600 + minutes * 60 + seconds
 
-  proc zonedTimeFromAdjTime(adjTime: Time): ZonedTime {.locks: 0.} =
+  proc zonedTimeFromAdjTime(adjTime: Time): ZonedTime =
+    result = default(ZonedTime)
     result.isDst = false
     result.utcOffset = offset
     result.time = adjTime + initDuration(seconds = offset)
 
-  proc zonedTimeFromTime(time: Time): ZonedTime {.locks: 0.}=
+  proc zonedTimeFromTime(time: Time): ZonedTime =
+    result = default(ZonedTime)
     result.isDst = false
     result.utcOffset = offset
     result.time = time
 
-  newTimezone("", zonedTimeFromTime, zonedTImeFromAdjTime)
+  newTimezone("", zonedTimeFromTime, zonedTimeFromAdjTime)
 
 template parseTest(s, f, sExpected: string, ydExpected: int) =
   let
@@ -70,7 +73,7 @@ template runTimezoneTests() =
       "2006-01-12T22:04:05Z", 11)
   # RFC3339Nano = "2006-01-02T15:04:05.999999999Z07:00"
   parseTest("2006-01-12T15:04:05.999999999Z-07:00",
-      "yyyy-MM-dd'T'HH:mm:ss'.999999999Z'zzz", "2006-01-12T22:04:05Z", 11)
+      "yyyy-MM-dd'T'HH:mm:ss.'999999999Z'zzz", "2006-01-12T22:04:05Z", 11)
   for tzFormat in ["z", "zz", "zzz"]:
     # formatting timezone as 'Z' for UTC
     parseTest("2001-01-12T22:04:05Z", "yyyy-MM-dd'T'HH:mm:ss" & tzFormat,
@@ -225,6 +228,18 @@ block: # ttimes
 
   block: # incorrect inputs: second
     parseTestExcp("2018-02-19 16:30:0", "yyyy-MM-dd hh:mm:ss")
+
+  block: # bug #26408; out of range minute/second raises TimeParseError
+    for (s, f) in [("2024-01-01 10:60:00", "yyyy-MM-dd HH:mm:ss"),
+                   ("2024-01-01 10:99:00", "yyyy-MM-dd HH:mm:ss"),
+                   ("2024-01-01 10:00:61", "yyyy-MM-dd HH:mm:ss"),
+                   ("2024-01-01 10:00:99", "yyyy-MM-dd HH:mm:ss"),
+                   ("2024-01-01 10:60:00", "yyyy-MM-dd H:m:s"),
+                   ("2024-01-01 10:00:61", "yyyy-MM-dd H:m:s")]:
+      expect TimeParseError:
+        discard s.parse(f, utc())
+    check $parse("2024-01-01 10:59:00", "yyyy-MM-dd HH:mm:ss", utc()) ==
+      "2024-01-01T10:59:00Z"
 
   block: # incorrect inputs: timezone (z)
     parseTestExcp("2018-02-19 16:30:00 ", "yyyy-MM-dd hh:mm:ss z")
@@ -646,3 +661,138 @@ block: # ttimes
     doAssert initDuration(milliseconds = 500).inMilliseconds == 500
     doAssert initDuration(milliseconds = -500).inMilliseconds == -500
     doAssert initDuration(nanoseconds = -999999999).inMilliseconds == -999
+
+  block: # getIsoWeekAndYear
+    doAssert getIsoWeekAndYear(initDateTime(04, mNov, 2019, 00, 00, 00)) == (isoweek: 45.IsoWeekRange, isoyear: 2019.IsoYear)
+    doAssert initDateTime(dMon, 45, 2019.IsoYear, 00, 00, 00) == initDateTime(04, mNov, 2019, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(28, mDec, 2019, 00, 00, 00)) == (isoweek: 52.IsoWeekRange, isoyear: 2019.IsoYear)
+    doAssert initDateTime(dSat, 52, 2019.IsoYear, 00, 00, 00) == initDateTime(28, mDec, 2019, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(29, mDec, 2019, 00, 00, 00)) == (isoweek: 52.IsoWeekRange, isoyear: 2019.IsoYear)
+    doAssert initDateTime(dSun, 52, 2019.IsoYear, 00, 00, 00) == initDateTime(29, mDec, 2019, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(30, mDec, 2019, 00, 00, 00)) == (isoweek: 01.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dMon, 01, 2020.IsoYear, 00, 00, 00) == initDateTime(30, mDec, 2019, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(31, mDec, 2019, 00, 00, 00)) == (isoweek: 01.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dTue, 01, 2020.IsoYear, 00, 00, 00) == initDateTime(31, mDec, 2019, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(01, mJan, 2020, 00, 00, 00)) == (isoweek: 01.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dWed, 01, 2020.IsoYear, 00, 00, 00) == initDateTime(01, mJan, 2020, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(02, mJan, 2020, 00, 00, 00)) == (isoweek: 01.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dThu, 01, 2020.IsoYear, 00, 00, 00) == initDateTime(02, mJan, 2020, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(05, mApr, 2020, 00, 00, 00)) == (isoweek: 14.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dSun, 14, 2020.IsoYear, 00, 00, 00) == initDateTime(05, mApr, 2020, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(06, mApr, 2020, 00, 00, 00)) == (isoweek: 15.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dMon, 15, 2020.IsoYear, 00, 00, 00) == initDateTime(06, mApr, 2020, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(10, mApr, 2020, 00, 00, 00)) == (isoweek: 15.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dFri, 15, 2020.IsoYear, 00, 00, 00) == initDateTime(10, mApr, 2020, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(12, mApr, 2020, 00, 00, 00)) == (isoweek: 15.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dSun, 15, 2020.IsoYear, 00, 00, 00) == initDateTime(12, mApr, 2020, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(13, mApr, 2020, 00, 00, 00)) == (isoweek: 16.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dMon, 16, 2020.IsoYear, 00, 00, 00) == initDateTime(13, mApr, 2020, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(15, mApr, 2020, 00, 00, 00)) == (isoweek: 16.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dThu, 16, 2020.IsoYear, 00, 00, 00) == initDateTime(16, mApr, 2020, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(17, mJul, 2020, 00, 00, 00)) == (isoweek: 29.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dFri, 29, 2020.IsoYear, 00, 00, 00) == initDateTime(17, mJul, 2020, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(19, mJul, 2020, 00, 00, 00)) == (isoweek: 29.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dSun, 29, 2020.IsoYear, 00, 00, 00) == initDateTime(19, mJul, 2020, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(20, mJul, 2020, 00, 00, 00)) == (isoweek: 30.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dMon, 30, 2020.IsoYear, 00, 00, 00) == initDateTime(20, mJul, 2020, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(23, mJul, 2020, 00, 00, 00)) == (isoweek: 30.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dThu, 30, 2020.IsoYear, 00, 00, 00) == initDateTime(23, mJul, 2020, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(31, mDec, 2020, 00, 00, 00)) == (isoweek: 53.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dThu, 53, 2020.IsoYear, 00, 00, 00) == initDateTime(31, mDec, 2020, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(01, mJan, 2021, 00, 00, 00)) == (isoweek: 53.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dFri, 53, 2020.IsoYear, 00, 00, 00) == initDateTime(01, mJan, 2021, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(02, mJan, 2021, 00, 00, 00)) == (isoweek: 53.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dSat, 53, 2020.IsoYear, 00, 00, 00) == initDateTime(02, mJan, 2021, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(03, mJan, 2021, 00, 00, 00)) == (isoweek: 53.IsoWeekRange, isoyear: 2020.IsoYear)
+    doAssert initDateTime(dSun, 53, 2020.IsoYear, 00, 00, 00) == initDateTime(03, mJan, 2021, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(04, mJan, 2021, 00, 00, 00)) == (isoweek: 01.IsoWeekRange, isoyear: 2021.IsoYear)
+    doAssert initDateTime(dMon, 01, 2021.IsoYear, 00, 00, 00) == initDateTime(04, mJan, 2021, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(01, mFeb, 2021, 00, 00, 00)) == (isoweek: 05.IsoWeekRange, isoyear: 2021.IsoYear)
+    doAssert initDateTime(dMon, 05, 2021.IsoYear, 00, 00, 00) == initDateTime(01, mFeb, 2021, 00, 00, 00)
+
+    doAssert getIsoWeekAndYear(initDateTime(01, mFeb, 2021, 01, 02, 03, 400_000_000, staticTz(hours=1))) == (isoweek: 05.IsoWeekRange, isoyear: 2021.IsoYear)
+    doAssert initDateTime(dMon, 05, 2021.IsoYear, 01, 02, 03, 400_000_000, staticTz(hours=1)) == initDateTime(01, mFeb, 2021, 01, 02, 03, 400_000_000, staticTz(hours=1))
+
+    doAssert getIsoWeekAndYear(initDateTime(01, mApr, +0001, 00, 00, 00)) == (isoweek: 13.IsoWeekRange, isoyear: 0001.IsoYear)
+    doAssert initDateTime(dSun, 13, 0001.IsoYear, 00, 00, 00) == initDateTime(01, mApr, 0001, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(01, mApr, +0000, 00, 00, 00)) == (isoweek: 13.IsoWeekRange, isoyear: 0000.IsoYear)
+    doAssert initDateTime(dSat, 13, 0000.IsoYear, 00, 00, 00) == initDateTime(01, mApr, 0000, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(01, mApr, -0001, 00, 00, 00)) == (isoweek: 13.IsoWeekRange, isoyear: (-0001).IsoYear)
+    doAssert initDateTime(dThu, 13, (-0001).IsoYear, 00, 00, 00) == initDateTime(01, mApr, -0001, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(01, mApr, -0002, 00, 00, 00)) == (isoweek: 14.IsoWeekRange, isoyear: (-0002).IsoYear)
+    doAssert initDateTime(dWed, 14, (-0002).IsoYear, 00, 00, 00) == initDateTime(01, mApr, -0002, 00, 00, 00)
+    doAssert getIsoWeekAndYear(initDateTime(01, mApr, -0753, 00, 00, 00)) == (isoweek: 14.IsoWeekRange, isoyear: (-0753).IsoYear)
+    doAssert initDateTime(dMon, 14, (-0753).IsoYear, 00, 00, 00) == initDateTime(01, mApr, -0753, 00, 00, 00)
+
+  block: # getWeeksInIsoYear
+    doAssert getWeeksInIsoYear((-0014).IsoYear) == 52
+    doAssert getWeeksInIsoYear((-0013).IsoYear) == 53
+    doAssert getWeeksInIsoYear((-0012).IsoYear) == 52
+
+    doAssert getWeeksInIsoYear((-0009).IsoYear) == 52
+    doAssert getWeeksInIsoYear((-0008).IsoYear) == 53
+    doAssert getWeeksInIsoYear((-0007).IsoYear) == 52
+
+    doAssert getWeeksInIsoYear((-0003).IsoYear) == 52
+    doAssert getWeeksInIsoYear((-0002).IsoYear) == 53
+    doAssert getWeeksInIsoYear((-0001).IsoYear) == 52
+
+    doAssert getWeeksInIsoYear(0003.IsoYear) == 52
+    doAssert getWeeksInIsoYear(0004.IsoYear) == 53
+    doAssert getWeeksInIsoYear(0005.IsoYear) == 52
+
+    doAssert getWeeksInIsoYear(1653.IsoYear) == 52
+    doAssert getWeeksInIsoYear(1654.IsoYear) == 53
+    doAssert getWeeksInIsoYear(1655.IsoYear) == 52
+
+    doAssert getWeeksInIsoYear(1997.IsoYear) == 52
+    doAssert getWeeksInIsoYear(1998.IsoYear) == 53
+    doAssert getWeeksInIsoYear(1999.IsoYear) == 52
+
+    doAssert getWeeksInIsoYear(2008.IsoYear) == 52
+    doAssert getWeeksInIsoYear(2009.IsoYear) == 53
+    doAssert getWeeksInIsoYear(2010.IsoYear) == 52
+
+    doAssert getWeeksInIsoYear(2014.IsoYear) == 52
+    doAssert getWeeksInIsoYear(2015.IsoYear) == 53
+    doAssert getWeeksInIsoYear(2016.IsoYear) == 52
+
+  block: # parse and generate iso years
+    # short calendar week with text
+    parseTest("KW 23 2023", "'KW' VV GGGG",
+      "2023-06-05T00:00:00Z", 155)
+    parseTest("KW 5 2023", "'KW' V GGGG",
+      "2023-01-30T00:00:00Z", 29)
+    parseTest("KW 05 23 Saturday", "'KW' V GG dddd",
+      "2023-02-04T00:00:00Z", 34)
+    parseTest("KW 53 20 Fri", "'KW' VV GG ddd",
+      "2021-01-01T00:00:00Z", 0)
+
+    parseTestExcp("KW 23", "'KW' VV") # no year
+    parseTestExcp("KW 23", "'KW' V") # no year
+    parseTestExcp("KW 23", "'KW' GG") # no week
+    parseTestExcp("KW 2023", "'KW' GGGG") # no week
+    
+    var dt = initDateTime(5, mJan, 2023, 0, 0, 0, utc())
+    check dt.format("V") == "1"
+    check dt.format("VV") == "01"
+    check dt.format("GG") == "23"
+    check dt.format("GGGG") == "2023"
+    check dt.format("dddd 'KW'V GGGG") == "Thursday KW1 2023"
+
+  block: # Can be used inside gcsafe proc
+    proc test(): DateTime {.gcsafe.} =
+      result = "1970".parse("yyyy")
+    doAssert test().year == 1970
+
+  block: # test FormatLiterals
+    # since #23861
+    block:
+      let dt = dateTime(2024, mJul, 21, 17, 01, 02, 123_321_123, utc())
+      check dt.format("ss.fff") == "02.123"
+      check dt.format("fff.ffffff") == "123.123321"
+    block:
+      let dt = parse("2024.07.21", "yyyy.MM.dd")
+      check dt.year == 2024
+      check dt.month == mJul
+      check dt.monthday == 21

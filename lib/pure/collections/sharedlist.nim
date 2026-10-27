@@ -11,10 +11,12 @@
 ##
 ## Unstable API.
 
-{.push stackTrace: off.}
+{.deprecated.}
+
+{.push stackTrace: off, checks: off.}
 
 import
-  locks
+  std/locks
 
 const
   ElemsPerNode = 100

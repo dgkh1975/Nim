@@ -19,13 +19,13 @@ when defined(linux) and not defined(android):
   # timer_{create,delete,settime,gettime},
   # clock_{getcpuclockid, getres, gettime, nanosleep, settime} lives in librt
   {.passl: "-lrt".}
-when defined(solaris):
+when defined(sunos):
   # On Solaris hstrerror lives in libresolv
   {.passl: "-lresolv".}
 
 type
   DIR* {.importc: "DIR", header: "<dirent.h>",
-          incompleteStruct.} = object
+          incompleteStruct, byref.} = object
     ## A type representing a directory stream.
 
 type
@@ -304,7 +304,7 @@ type
   Stack* {.importc: "stack_t",
             header: "<signal.h>", final, pure.} = object ## stack_t
     ss_sp*: pointer  ## Stack base or pointer.
-    ss_size*: csize  ## Stack size.
+    ss_size*: csize_t ## Stack size.
     ss_flags*: cint  ## Flags.
 
   SigInfo* {.importc: "siginfo_t",
@@ -372,7 +372,7 @@ elif defined(haiku):
   # from sys/un.h
   const Sockaddr_un_path_length* = 126
 else:
-  # according to http://pubs.opengroup.org/onlinepubs/009604499/basedefs/sys/un.h.html
+  # according to https://pubs.opengroup.org/onlinepubs/009604499/basedefs/sys/un.h.html
   # this is >=92
   const Sockaddr_un_path_length* = 92
 
@@ -404,7 +404,7 @@ type
   IOVec* {.importc: "struct iovec", pure, final,
             header: "<sys/uio.h>".} = object ## struct iovec
     iov_base*: pointer ## Base address of a memory region for input or output.
-    iov_len*: csize    ## The size of the memory pointed to by iov_base.
+    iov_len*: csize_t  ## The size of the memory pointed to by iov_base.
 
   Tmsghdr* {.importc: "struct msghdr", pure, final,
              header: "<sys/socket.h>".} = object  ## struct msghdr
@@ -519,8 +519,6 @@ type
     events*: cshort  ## The input event flags (see below).
     revents*: cshort ## The output event flags (see below).
 
-  Tnfds* {.importc: "nfds_t", header: "<poll.h>".} = culong
-
 var
   errno* {.importc, header: "<errno.h>".}: cint ## error variable
   h_errno* {.importc, header: "<netdb.h>".}: cint
@@ -557,7 +555,7 @@ when defined(macosx):
     MSG_NOSIGNAL* = 0'i32
   var
     SO_NOSIGPIPE* {.importc, header: "<sys/socket.h>".}: cint
-elif defined(solaris):
+elif defined(sunos):
   # Solaris doesn't have MSG_NOSIGNAL
   const
     MSG_NOSIGNAL* = 0'i32

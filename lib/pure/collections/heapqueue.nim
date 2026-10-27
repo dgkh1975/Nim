@@ -47,6 +47,9 @@ runnableExamples:
 
 import std/private/since
 
+when defined(nimPreviewSlimSystem):
+  import std/assertions
+
 type HeapQueue*[T] = object
   ## A heap queue, commonly known as a priority queue.
   data: seq[T]
@@ -59,7 +62,7 @@ proc initHeapQueue*[T](): HeapQueue[T] =
   ##
   ## **See also:**
   ## * `toHeapQueue proc <#toHeapQueue,openArray[T]>`_
-  discard
+  result = default(HeapQueue[T])
 
 proc len*[T](heap: HeapQueue[T]): int {.inline.} =
   ## Returns the number of elements of `heap`.
@@ -72,6 +75,13 @@ proc len*[T](heap: HeapQueue[T]): int {.inline.} =
 proc `[]`*[T](heap: HeapQueue[T], i: Natural): lent T {.inline.} =
   ## Accesses the i-th element of `heap`.
   heap.data[i]
+
+iterator items*[T](heap: HeapQueue[T]): lent T {.inline, since: (2, 1, 1).} =
+  ## Iterates over each item of `heap`.
+  let L = len(heap)
+  for i in 0 .. high(heap.data):
+    yield heap.data[i]
+    assert(len(heap) == L, "the length of the HeapQueue changed while iterating over it")
 
 proc heapCmp[T](x, y: T): bool {.inline.} = x < y
 
@@ -147,7 +157,7 @@ proc toHeapQueue*[T](x: openArray[T]): HeapQueue[T] {.since: (1, 3).} =
     assert heap[0] == 8
 
   # see https://en.wikipedia.org/wiki/Binary_heap#Building_a_heap
-  result.data = @x
+  result = HeapQueue[T](data: @x)
   for i in countdown(x.len div 2 - 1, 0):
     siftdown(result, i)
 
@@ -178,6 +188,11 @@ proc find*[T](heap: HeapQueue[T], x: T): int {.since: (1, 3).} =
   for i in 0 ..< heap.len:
     if heap[i] == x: return i
 
+proc contains*[T](heap: HeapQueue[T], x: T): bool {.since: (2, 1, 1).} =
+  ## Returns true if `x` is in `heap` or false if not found. This is a shortcut
+  ## for `find(heap, x) >= 0`.
+  result = find(heap, x) >= 0
+
 proc del*[T](heap: var HeapQueue[T], index: Natural) =
   ## Removes the element at `index` from `heap`, maintaining the heap invariant.
   runnableExamples:
@@ -190,7 +205,10 @@ proc del*[T](heap: var HeapQueue[T], index: Natural) =
   let newLen = heap.len - 1
   heap.data.setLen(newLen)
   if index < newLen:
-    siftdownToBottom(heap, index)
+    if index > 0 and heapCmp(heap[index], heap[(index - 1) shr 1]):
+      siftup(heap, 0, index)
+    else:
+      siftdownToBottom(heap, index)
 
 proc replace*[T](heap: var HeapQueue[T], item: sink T): T =
   ## Pops and returns the current smallest value, and add the new item.
@@ -245,7 +263,9 @@ proc `$`*[T](heap: HeapQueue[T]): string =
     assert $heap == "[1, 2]"
 
   result = "["
+  var first = true
   for x in heap.data:
-    if result.len > 1: result.add(", ")
+    if first: first = false
+    else: result.add(", ")
     result.addQuoted(x)
   result.add("]")
